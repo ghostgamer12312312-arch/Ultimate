@@ -64,9 +64,12 @@ def main_menu_keyboard():
         [InlineKeyboardButton("🌍 World Raid", callback_data="menu:raid"), InlineKeyboardButton("🏯 Clan", callback_data="menu:clan")],
         [InlineKeyboardButton("🎒 Inventory", callback_data="menu:inventory"), InlineKeyboardButton("🛒 Shop", callback_data="menu:shop")],
         [InlineKeyboardButton("🏰 Dungeon", callback_data="menu:dungeon"), InlineKeyboardButton("🐾 Pets", callback_data="menu:pets")],
+        [InlineKeyboardButton("🧭 Explore", callback_data="menu:explore"), InlineKeyboardButton("💚 Heal", callback_data="menu:heal")],
         [InlineKeyboardButton("🎣 Fish", callback_data="menu:fish"), InlineKeyboardButton("⛏️ Mine", callback_data="menu:mine")],
         [InlineKeyboardButton("📖 Story", callback_data="menu:chapters"), InlineKeyboardButton("🌌 Summon Boss", callback_data="menu:summonboss")],
         [InlineKeyboardButton("📜 Quests", callback_data="menu:quests"), InlineKeyboardButton("🏆 Rankings", callback_data="menu:leaderboard")],
+        [InlineKeyboardButton("🎯 Pity", callback_data="menu:pity"), InlineKeyboardButton("🌀 Elements", callback_data="menu:element")],
+        [InlineKeyboardButton("👑 Crown Art", callback_data="menu:crown"), InlineKeyboardButton("🧹 Unstuck", callback_data="menu:unstuck")],
         [InlineKeyboardButton("📖 Help", callback_data="menu:help")],
     ])
 

@@ -50,7 +50,7 @@ def scaled_character(character: dict) -> dict:
     }
 
 
-def effective_stats(db, user_id: int) -> dict:
+def effective_stats(db, user_id: int, main_id: str | None = None) -> dict:
     player = db.require_player(user_id)
     rank = data.rank_for_level(int(player["level"]))
     base = {
@@ -61,13 +61,28 @@ def effective_stats(db, user_id: int) -> dict:
     }
     for key in base:
         base[key] *= rank["bonus"]
+    attributes = {
+        "strength": int(player.get("strength", 10) or 10),
+        "agility": int(player.get("agility", 10) or 10),
+        "intellect": int(player.get("intellect", 10) or 10),
+        "vitality": int(player.get("vitality", 10) or 10),
+        "luck": int(player.get("luck", 10) or 10),
+    }
+    base["hp"] += attributes["vitality"] * 6
+    base["atk"] += attributes["strength"] * 1.8
+    base["def"] += attributes["vitality"] * 0.9
+    base["spd"] += attributes["agility"] * 0.8
 
     characters = {character["id"]: character for character in db.characters(user_id)}
     team_ids = db.team(user_id)
     if not team_ids and player.get("equipped_char") in characters:
         team_ids = [player["equipped_char"]]
-    main = next((characters[cid] for cid in team_ids if cid in characters), None)
-    support = [characters[cid] for cid in team_ids[1:] if cid in characters]
+    if main_id and main_id in characters:
+        main = characters[main_id]
+        support = [characters[cid] for cid in team_ids if cid in characters and cid != main_id][:2]
+    else:
+        main = next((characters[cid] for cid in team_ids if cid in characters), None)
+        support = [characters[cid] for cid in team_ids[1:] if cid in characters]
 
     gear_slot_ids = [player.get("weapon"), player.get("armor"), player.get("accessory")]
     gear_items = []
@@ -130,18 +145,22 @@ def effective_stats(db, user_id: int) -> dict:
     if main is None:
         element = "spirit"
 
+    max_mp = max(60, int(120 + int(player["level"]) * 4 + attributes["intellect"] * 8))
     return {
         "name": main["name"] if main else (player.get("first_name") or player.get("username") or "Summoner"),
         "hp": max(1, int(base["hp"])),
         "atk": max(1, int(base["atk"])),
         "def": max(0, int(base["def"])),
         "spd": max(1, int(base["spd"])),
-        "crit": min(0.65, 0.08 + passives.get("crit", 0.0) + title.get("crit", 0.0)),
-        "dodge": min(0.45, 0.04 + passives.get("dodge", 0.0) + title.get("dodge", 0.0)),
+        "mp": max_mp,
+        "max_mp": max_mp,
+        "crit": min(0.65, 0.08 + attributes["luck"] * 0.0008 + passives.get("crit", 0.0) + title.get("crit", 0.0)),
+        "dodge": min(0.45, 0.04 + attributes["agility"] * 0.0006 + passives.get("dodge", 0.0) + title.get("dodge", 0.0)),
         "element": element,
         "skills": active_skills,
         "series": main["series"] if main else player.get("travel", "dragonball"),
         "rank": rank["name"],
+        "attributes": attributes,
     }
 
 

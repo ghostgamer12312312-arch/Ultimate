@@ -66,9 +66,17 @@ CREATE TABLE IF NOT EXISTS players (
     stamina_updated INTEGER NOT NULL DEFAULT 0,
     hp INTEGER NOT NULL DEFAULT 1000,
     current_hp INTEGER NOT NULL DEFAULT 1000,
+    mp INTEGER NOT NULL DEFAULT 200,
+    max_mp INTEGER NOT NULL DEFAULT 200,
     atk INTEGER NOT NULL DEFAULT 100,
     def INTEGER NOT NULL DEFAULT 50,
     spd INTEGER NOT NULL DEFAULT 30,
+    strength INTEGER NOT NULL DEFAULT 10,
+    agility INTEGER NOT NULL DEFAULT 10,
+    intellect INTEGER NOT NULL DEFAULT 10,
+    vitality INTEGER NOT NULL DEFAULT 10,
+    luck INTEGER NOT NULL DEFAULT 10,
+    stat_points INTEGER NOT NULL DEFAULT 0,
     skill_points INTEGER NOT NULL DEFAULT 3,
     equipped_char TEXT,
     team TEXT NOT NULL DEFAULT '[]',
@@ -313,6 +321,28 @@ CREATE TABLE IF NOT EXISTS clan_invites (
     PRIMARY KEY(clan_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS active_battles (
+    battle_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    mode TEXT NOT NULL,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS custom_art (
+    entity_type TEXT NOT NULL,
+    entity_key TEXT NOT NULL,
+    name TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    uploaded_by INTEGER,
+    uploaded_at TEXT NOT NULL,
+    PRIMARY KEY(entity_type, entity_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_active_battles_user ON active_battles(user_id);
+CREATE INDEX IF NOT EXISTS idx_custom_art_type ON custom_art(entity_type);
 CREATE INDEX IF NOT EXISTS idx_characters_user ON characters(user_id);
 CREATE INDEX IF NOT EXISTS idx_counters_user ON counters(user_id, key);
 CREATE INDEX IF NOT EXISTS idx_clan_members_clan ON clan_members(clan_id);
@@ -377,9 +407,17 @@ class Database:
             "players": {
                 "hp": "INTEGER NOT NULL DEFAULT 1000",
                 "current_hp": "INTEGER NOT NULL DEFAULT 1000",
+                "mp": "INTEGER NOT NULL DEFAULT 200",
+                "max_mp": "INTEGER NOT NULL DEFAULT 200",
                 "atk": "INTEGER NOT NULL DEFAULT 100",
                 "def": "INTEGER NOT NULL DEFAULT 50",
                 "spd": "INTEGER NOT NULL DEFAULT 30",
+                "strength": "INTEGER NOT NULL DEFAULT 10",
+                "agility": "INTEGER NOT NULL DEFAULT 10",
+                "intellect": "INTEGER NOT NULL DEFAULT 10",
+                "vitality": "INTEGER NOT NULL DEFAULT 10",
+                "luck": "INTEGER NOT NULL DEFAULT 10",
+                "stat_points": "INTEGER NOT NULL DEFAULT 0",
                 "skill_points": "INTEGER NOT NULL DEFAULT 3",
                 "equipped_char": "TEXT",
                 "team": "TEXT NOT NULL DEFAULT '[]'",
@@ -2136,9 +2174,99 @@ class Database:
             c.execute("INSERT OR IGNORE INTO chapter_progress(user_id, series, chapter, cleared_at) VALUES(?,?,?,?)", (int(user_id), series, int(chapter), _now()))
 
 
+    def set_vitals(self, user_id: int, *, hp: int | None = None, mp: int | None = None) -> dict:
+        updates: list[str] = []
+        values: list[int] = []
+        if hp is not None:
+            updates.append("current_hp=?")
+            values.append(max(0, int(hp)))
+        if mp is not None:
+            updates.append("mp=?")
+            values.append(max(0, int(mp)))
+        if updates:
+            values.append(int(user_id))
+            with self.conn() as c:
+                c.execute(f"UPDATE players SET {', '.join(updates)} WHERE user_id=?", values)
+        return self.require_player(user_id)
+
+    def heal_player(self, user_id: int, hp: int = 0, mp: int = 0) -> dict:
+        player = self.require_player(user_id)
+        new_hp = min(int(player.get("hp", 1)), max(0, int(player.get("current_hp", 1))) + max(0, int(hp)))
+        new_mp = min(int(player.get("max_mp", 200)), max(0, int(player.get("mp", 0))) + max(0, int(mp)))
+        self.set_vitals(user_id, hp=new_hp, mp=new_mp)
+        return {"hp": new_hp, "max_hp": int(player.get("hp", 1)), "mp": new_mp, "max_mp": int(player.get("max_mp", 200))}
+
+    def allocate_stat(self, user_id: int, stat: str, points: int = 1) -> dict:
+        allowed = {"strength", "agility", "intellect", "vitality", "luck"}
+        stat = stat.lower()
+        if stat not in allowed:
+            return {"ok": False, "reason": "Unknown stat."}
+        points = max(1, int(points))
+        player = self.require_player(user_id)
+        if int(player.get("stat_points", 0)) < points:
+            return {"ok": False, "reason": "Not enough stat points."}
+        with self.conn() as c:
+            c.execute(
+                f"UPDATE players SET {stat}={stat}+?, stat_points=stat_points-? WHERE user_id=? AND stat_points>=?",
+                (points, points, int(user_id), points),
+            )
+        return {"ok": True, "stat": stat, "points": points}
+
+    def active_battle(self, user_id: int) -> dict | None:
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM active_battles WHERE user_id=? ORDER BY updated_at DESC LIMIT 1", (int(user_id),)).fetchone()
+        battle = _row_to_dict(row)
+        if battle:
+            try:
+                battle["state"] = json.loads(battle["state"])
+            except (TypeError, ValueError):
+                battle["state"] = {}
+        return battle
+
+    def save_battle(self, battle: dict) -> None:
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO active_battles(battle_id, user_id, mode, title, state, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(battle_id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at",
+                (
+                    battle["battle_id"], int(battle["user_id"]), battle["mode"], battle["title"],
+                    json.dumps(battle["state"], ensure_ascii=False), battle["created_at"], _now(),
+                ),
+            )
+
+    def clear_battle(self, user_id: int) -> None:
+        with self.conn() as c:
+            c.execute("DELETE FROM active_battles WHERE user_id=?", (int(user_id),))
+
+    def art_set(self, entity_type: str, entity_key: str, name: str, file_id: str, uploaded_by: int | None = None) -> None:
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO custom_art(entity_type, entity_key, name, file_id, uploaded_by, uploaded_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(entity_type,entity_key) DO UPDATE SET name=excluded.name, file_id=excluded.file_id, uploaded_by=excluded.uploaded_by, uploaded_at=excluded.uploaded_at",
+                (entity_type, entity_key, name, file_id, int(uploaded_by) if uploaded_by else None, _now()),
+            )
+
+    def art_get(self, entity_type: str, entity_key: str) -> dict | None:
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM custom_art WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
+        return _row_to_dict(row)
+
+    def art_list(self, entity_type: str | None = None) -> list[dict]:
+        with self.conn() as c:
+            if entity_type:
+                rows = c.execute("SELECT * FROM custom_art WHERE entity_type=? ORDER BY name", (entity_type,)).fetchall()
+            else:
+                rows = c.execute("SELECT * FROM custom_art ORDER BY entity_type, name").fetchall()
+        return _rows_to_dicts(rows)
+
+    def art_keys(self, entity_type: str) -> set[str]:
+        with self.conn() as c:
+            rows = c.execute("SELECT entity_key FROM custom_art WHERE entity_type=?", (entity_type,)).fetchall()
+        return {row["entity_key"] for row in rows}
+
     def reset_player(self, user_id: int) -> None:
         with self.conn() as c:
-            for table in ("characters", "character_shards", "pets", "items", "gear", "skills", "counters", "quest_claims", "achievement_claims"):
+            for table in ("characters", "character_shards", "pets", "items", "gear", "skills", "counters", "quest_claims", "achievement_claims", "active_battles"):
                 c.execute(f"DELETE FROM {table} WHERE user_id=?", (int(user_id),))
             c.execute("UPDATE players SET clan_id=NULL WHERE user_id=?", (int(user_id),))
             c.execute("DELETE FROM clan_members WHERE user_id=?", (int(user_id),))
