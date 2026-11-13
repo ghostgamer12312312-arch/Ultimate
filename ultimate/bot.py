@@ -607,6 +607,7 @@ async def team_view(
     context: ContextTypes.DEFAULT_TYPE,
     series: str | None = None,
     rarity: str | None = None,
+    page: int = 1,
 ) -> None:
     player = await guard(update, context)
     if player is None:
@@ -680,17 +681,29 @@ async def team_view(
     )
     for index in range(0, len(rarity_buttons), 4):
         rows.append(rarity_buttons[index:index + 4])
+    total_pages = max(1, (len(available) + 19) // 20)
+    page = min(max(1, page), total_pages)
+    page_items = available[(page - 1) * 20:page * 20]
+    lines.append(f"<i>Page {page}/{total_pages} • {len(available)} available</i>")
     add_buttons = [
         InlineKeyboardButton(
             f"➕ {c['name']} Lv.{c['level']}",
             callback_data=f"team:add:{c['id']}",
         )
-        for c in available[:20]
+        for c in page_items
     ]
     for index in range(0, len(add_buttons), 2):
         rows.append(add_buttons[index:index + 2])
     if not available:
         lines.append("<i>No available heroes match this filter.</i>")
+    else:
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"team:filter:{series or 'all'}:{rarity or 'all'}:{page - 1}"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"team:filter:{series or 'all'}:{rarity or 'all'}:{page + 1}"))
+        if nav:
+            rows.append(nav)
     rows.append([InlineKeyboardButton("🧹 Clear Team", callback_data="team:clear"), InlineKeyboardButton("🎴 Heroes", callback_data="chars:all:all:1")])
     rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
@@ -2797,14 +2810,31 @@ def _resolve_art_target(query: str, forced_type: str | None = None, db: Database
         return None
     catalog = _art_catalog(db)
     types = [forced_type] if forced_type in catalog else list(catalog)
-    key = query.lower().replace(" ", "_")
-    for entity_type in types:
-        entries = catalog[entity_type]
-        if key in entries:
-            return entity_type, key, entries[key]["name"]
-        for entity_key, entry in entries.items():
-            if query.lower() == entry["name"].lower() or query.lower() in entry["name"].lower():
-                return entity_type, entity_key, entry["name"]
+    variants = [query]
+    for separator in ("—", "–", " - "):
+        if separator in query:
+            variants = [part.strip() for part in query.split(separator) if part.strip()]
+            break
+
+    def normalize(value: str) -> str:
+        return "".join(ch for ch in value.lower() if ch.isalnum())
+
+    for candidate in variants:
+        key = candidate.lower().replace(" ", "_")
+        normalized = normalize(candidate)
+        for entity_type in types:
+            entries = catalog[entity_type]
+            if key in entries:
+                return entity_type, key, entries[key]["name"]
+            for entity_key, entry in entries.items():
+                if normalize(entity_key) == normalized or normalize(entry["name"]) == normalized:
+                    return entity_type, entity_key, entry["name"]
+        for entity_type in types:
+            entries = catalog[entity_type]
+            for entity_key, entry in entries.items():
+                lowered = entry["name"].lower()
+                if candidate.lower() in lowered or lowered in candidate.lower():
+                    return entity_type, entity_key, entry["name"]
     return None
 
 
@@ -2814,6 +2844,9 @@ async def cmd_explore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     db = get_db(context)
     series = parse_series(context.args[0]) if context.args else player.get("travel", "dragonball")
+    if series is None:
+        await respond(update, "❌ Unknown series. Use /explore dragonball|naruto|bleach|jujutsu|tempest.", ui.back_keyboard("menu:main"))
+        return
     info = data.SERIES[series]
     npcs = data.NPCS[series]
     stamina = player["stamina"]
@@ -3021,15 +3054,16 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     message = update.effective_message
     if message is None:
         return
+    source = getattr(message, "reply_to_message", None) or message
     file_id = None
-    photo = getattr(message, "photo", None)
-    document = getattr(message, "document", None)
+    photo = getattr(source, "photo", None)
+    document = getattr(source, "document", None)
     if photo:
         file_id = photo[-1].file_id
     elif document and (document.mime_type or "").startswith("image/"):
         file_id = document.file_id
     if not file_id:
-        await respond(update, "Reply to a photo or image file with <code>/upload NAME</code>.")
+        await respond(update, "Reply to a photo or image file with <code>/upload NAME</code>, or send the photo with the command as its caption.")
         return
     args = list(context.args)
     if not args:
@@ -3581,7 +3615,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if action == "filter" and len(parts) > 3:
             series = parts[2] if parts[2] != "all" else None
             rarity = parts[3] if parts[3] != "all" else None
-            await team_view(update, context, series=series, rarity=rarity)
+            page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 1
+            await team_view(update, context, series=series, rarity=rarity, page=page)
             return
         if action in ("up", "down") and len(parts) > 2:
             char_id = parts[2]
