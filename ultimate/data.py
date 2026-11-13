@@ -787,6 +787,21 @@ CRAFTING_RECIPES = [
     {"id": "craft_multiverse_relic", "result": "gear_univ_multiverse_relic", "cost": {"yens": 15000, "energy_dark": 5, "crystal_shard": 10, "forge_core": 5}},
 ]
 
+PROFILE_AVATARS = {
+    "rookie": {"name": "Rookie", "icon": "🌱", "level": 1},
+    "fighter": {"name": "Fighter", "icon": "⚔️", "level": 5},
+    "hunter": {"name": "Hunter", "icon": "🏹", "level": 10},
+    "ninja": {"name": "Shinobi", "icon": "🥷", "level": 15},
+    "soul": {"name": "Soul Reaper", "icon": "⛩️", "level": 20},
+    "flame": {"name": "Flame Lord", "icon": "🔥", "level": 25},
+    "dragon": {"name": "Dragon Master", "icon": "🐉", "level": 30},
+    "storm": {"name": "Storm King", "icon": "⚡", "level": 40},
+    "oracle": {"name": "Oracle", "icon": "🔮", "level": 50},
+    "crown": {"name": "Crowned Legend", "icon": "👑", "level": 60},
+}
+
+CLAN_BONUS_PER_LEVEL = 0.02
+
 DAILY_SHOP_POOL = [
     "senzu_large", "stamina_drink", "exp_tome", "gacha_ticket", "elite_key", "boss_key",
     "raid_token", "awakening_stone", "forge_core", "crystal_shard", "shard_rare",
@@ -949,7 +964,7 @@ EXTRA_SKILLS = {
         ("zanka_north", "Zanka no Tachi: North", "fire", 2.62, "A slash of absolute heat."),
         ("sankt_altar", "Sankt Altar", "light", 2.28, "Steal power through a Quincy ritual."),
         ("auswahlen", "Auswahlen", "light", 2.58, "A divine selection of souls."),
-        ("the_almanac", "The Almighty", "void", 2.70, "See and rewrite every future."),
+        ("the_almighty", "The Almighty", "void", 2.70, "See and rewrite every future."),
         ("irazusando", "Irazusando", "spirit", 2.40, "A forbidden technique of the Soul King."),
         ("getsuga_jujisho", "Getsuga Jujisho", "dark", 2.46, "A cross-shaped crescent of reiatsu."),
     ],

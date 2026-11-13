@@ -72,6 +72,11 @@ def effective_stats(db, user_id: int, main_id: str | None = None) -> dict:
     base["atk"] += attributes["strength"] * 1.8
     base["def"] += attributes["vitality"] * 0.9
     base["spd"] += attributes["agility"] * 0.8
+    clan = db.clan(user_id)
+    clan_bonus = min(0.20, data.CLAN_BONUS_PER_LEVEL * int((clan or {}).get("level", 0)))
+    if clan_bonus:
+        base["atk"] *= 1.0 + clan_bonus
+        base["def"] *= 1.0 + clan_bonus
 
     characters = {character["id"]: character for character in db.characters(user_id)}
     team_ids = db.team(user_id)
@@ -161,7 +166,83 @@ def effective_stats(db, user_id: int, main_id: str | None = None) -> dict:
         "series": main["series"] if main else player.get("travel", "dragonball"),
         "rank": rank["name"],
         "attributes": attributes,
+        "clan_bonus": clan_bonus,
     }
+
+
+SKILL_TAG_ORDER = ("REGENERATION", "DEFENSE", "LUCK", "DROP RATE", "PULL RATE", "ATTACK")
+
+
+def skill_tags(skill: dict) -> list[str]:
+    tags: set[str] = set()
+    bonus = skill.get("bonus") or {}
+    if skill.get("type") == "passive":
+        if bonus.get("atk_pct"):
+            tags.add("ATTACK")
+        if bonus.get("hp_pct"):
+            tags.add("REGENERATION")
+        if bonus.get("def_pct"):
+            tags.add("DEFENSE")
+        if bonus.get("crit") or bonus.get("dodge"):
+            tags.add("LUCK")
+        if bonus.get("spd_pct"):
+            tags.add("LUCK")
+    else:
+        tags.add("ATTACK")
+    lower = f"{skill.get('id', '')} {skill.get('name', '')}".lower()
+    if any(word in lower for word in ("phoenix", "regen", "heal", "life", "blood")):
+        tags.add("REGENERATION")
+    if any(word in lower for word in ("wall", "shield", "guard", "aegis", "fortress", "defense")):
+        tags.add("DEFENSE")
+    if any(word in lower for word in ("luck", "fate", "almighty", "dice", "fortune", "gamble")):
+        tags.add("LUCK")
+    if "almighty" in lower:
+        tags.add("PULL RATE")
+    if any(word in lower for word in ("greed", "gold", "treasure", "plunder", "loot")):
+        tags.add("DROP RATE")
+    if any(word in lower for word in ("pull", "summon", "banner", "wish")):
+        tags.add("PULL RATE")
+    return [tag for tag in SKILL_TAG_ORDER if tag in tags] or ["ATTACK"]
+
+
+def skill_effect(skill: dict) -> str:
+    parts: list[str] = []
+    if skill.get("type") == "active":
+        element = str(skill.get("element", "spirit")).title()
+        parts.append(f"Deals x{float(skill.get('power', 1.0)):.2f} {element} damage")
+        cooldown = int(skill.get("cooldown", 0) or 0)
+        if cooldown:
+            parts.append(f"{cooldown}-turn cooldown")
+    for key, value in (skill.get("bonus") or {}).items():
+        pct = float(value) * 100
+        label = {
+            "atk_pct": "ATK", "def_pct": "DEF", "hp_pct": "Max HP", "spd_pct": "SPD",
+            "crit": "Crit chance", "dodge": "Dodge chance",
+        }.get(key, key.replace("_", " ").title())
+        parts.append(f"+{pct:.1f}% {label}")
+    lower = f"{skill.get('id', '')} {skill.get('name', '')}".lower()
+    if "phoenix" in lower:
+        parts.append("heals 15% Max HP when used")
+    if "abyss_requiem" in lower:
+        parts.append("restores 25 MP when used")
+    if "world_breaker" in lower:
+        parts.append("shields the next enemy hit")
+    if "almighty" in lower:
+        parts.append("+25% Crit Luck (3 turns) and +10% Mythic Pull Rate")
+    if not parts:
+        parts.append(str(skill.get("description") or "No bonus effect."))
+    return " • ".join(parts)
+
+
+def avatar_for(player: dict) -> dict:
+    return data.PROFILE_AVATARS.get(player.get("avatar") or "rookie", data.PROFILE_AVATARS["rookie"])
+
+
+def clan_bonus_text(clan: dict | None) -> str:
+    if not clan:
+        return "No clan bonus"
+    pct = min(0.20, data.CLAN_BONUS_PER_LEVEL * int(clan.get("level", 1))) * 100
+    return f"+{pct:.0f}% ATK & DEF"
 
 
 def enemy_from_boss(boss: dict, scale: float = 1.0) -> dict:
@@ -544,9 +625,11 @@ def arena(db, user_id: int) -> dict:
     return duel(db, user_id, int(opponent["user_id"]))
 
 
-def _pick_rarity(rng: random.Random, pity: int) -> str:
+def _pick_rarity(rng: random.Random, pity: int, pull_boost: float = 0.0) -> str:
     if pity >= config.GACHA_PITY - 1:
         return rng.choices(["mythic", "divine"], weights=[5, 1])[0]
+    if pull_boost and rng.random() < pull_boost:
+        return "mythic"
     rarities = data.RARITY_ORDER
     weights = [data.RARITIES[rarity]["weight"] for rarity in rarities]
     return rng.choices(rarities, weights=weights)[0]
@@ -593,8 +676,12 @@ def gacha(db, user_id: int, banner_id: str = "dragonball", count: int = 1) -> di
     results = []
     rng = random.Random()
     pity = int(player["pity"])
+    pull_boost = 0.10 if any(
+        skill["id"] == "the_almighty" and skill.get("equipped")
+        for skill in db.skills(user_id)
+    ) else 0.0
     for _ in range(count):
-        rarity = _pick_rarity(rng, pity)
+        rarity = _pick_rarity(rng, pity, pull_boost)
         char_id = _pick_character(banner["series"], rarity, banner, rng)
         if char_id is None:
             continue

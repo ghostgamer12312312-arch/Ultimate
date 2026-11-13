@@ -594,6 +594,9 @@ def _enemy_attack(db, user_id: int, battle: dict, rng: random.Random) -> None:
     else:
         if state.get("guard"):
             damage = max(1, int(damage * 0.40))
+        if state.get("shield"):
+            damage = max(1, int(damage * 0.70))
+            state["shield"] = 0
         player["hp"] = max(0, int(player["hp"]) - damage)
         label = f"✨ {skill['name']}" if skill else "⚔️ Enemy attack"
         crit_label = " **CRITICAL**" if crit else ""
@@ -698,6 +701,9 @@ def act(db, user_id: int, battle_id: str, action: str, payload: str | None = Non
         if int(state.get("transform", 0)) > 0:
             attacker = dict(player)
             attacker["atk"] = int(float(player["atk"]) * 1.30)
+        if int(state.get("almighty", 0)) > 0:
+            attacker = dict(attacker)
+            attacker["crit"] = float(attacker.get("crit", 0.08)) + 0.25
         damage, crit, dodged = game.attack_damage(attacker, enemy, skill, rng)
         if dodged:
             state["log"].append(f"💨 {enemy['name']} dodged your attack!")
@@ -706,10 +712,29 @@ def act(db, user_id: int, battle_id: str, action: str, payload: str | None = Non
             label = f"✨ {skill['name']}" if skill else "⚔️ Basic attack"
             crit_label = " **CRITICAL**" if crit else ""
             state["log"].append(f"{label}: you dealt {damage:,} damage.{crit_label}")
+        used_skill_id = skill.get("id") if skill else None
+        if used_skill_id and "phoenix" in used_skill_id and int(player["hp"]) > 0:
+            heal = max(1, int(int(player["max_hp"]) * 0.15))
+            before = int(player["hp"])
+            player["hp"] = min(int(player["max_hp"]), before + heal)
+            state["log"].append(f"🔥 Phoenix Fang restored {player['hp'] - before:,} HP.")
+        elif used_skill_id == "abyss_requiem":
+            before = int(player["mp"])
+            player["mp"] = min(int(player["max_mp"]), before + 25)
+            if player["mp"] > before:
+                state["log"].append(f"🔵 Abyss Requiem restored {player['mp'] - before} MP.")
+        elif used_skill_id == "world_breaker":
+            state["shield"] = 1
+            state["log"].append("🛡️ World Breaker raised a shield for the next hit.")
+        elif used_skill_id == "the_almighty":
+            state["almighty"] = 3
+            state["log"].append("🔮 The Almighty grants +25% Crit Luck for 3 turns.")
         if int(enemy["hp"]) > 0:
             _enemy_attack(db, user_id, battle, rng)
     if action != "transform" and int(state.get("transform", 0)) > 0:
         state["transform"] = int(state["transform"]) - 1
+    if int(state.get("almighty", 0)) > 0:
+        state["almighty"] = int(state["almighty"]) - 1
     state["turn"] = int(state.get("turn", 1)) + 1
     if int(player["hp"]) <= 0:
         state["log"].append("💀 You were defeated!")

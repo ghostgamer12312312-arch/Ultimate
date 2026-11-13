@@ -239,7 +239,7 @@ def profile_card(player: dict, stats: dict, characters: int, pets: int, clan: di
         f"HP {stats.get('hp', 0):,}    ATK {stats.get('atk', 0):,}    DEF {stats.get('def', 0):,}    SPD {stats.get('spd', 0):,}",
         f"Yens {player.get('yens', 0):,}    Gems {player.get('gems', 0):,}    Crystals {player.get('crystals', 0):,}",
         f"Characters {characters}    Companions {pets}    PvP wins {player.get('pvp_wins', 0)}",
-        f"Clan: {clan.get('name') if clan else 'None'}",
+        f"Avatar: {data.PROFILE_AVATARS.get(player.get('avatar') or 'rookie', data.PROFILE_AVATARS['rookie'])['name']}    Clan: {clan.get('name') if clan else 'None'}",
         f"Total battles {player.get('total_battles', 0)}    Boss kills {player.get('boss_kills', 0)}",
     ]
     return generic_card("profile", str(player.get("user_id", "player")), player.get("first_name") or player.get("username") or "Summoner", "PLAYER PROFILE", lines, player.get("series", "universal"), "PROFILE", extra=str(stats.get("atk", 0)))

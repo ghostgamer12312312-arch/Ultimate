@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
@@ -317,11 +317,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/pic [profile|clan|character|boss|summon|npc|gear|item|chapter] [name/id]\n"
         "/upload TYPE NAME — reply to a photo to save custom art\n"
         "/banner • /settings • /about • /myid\n\n"
-        "<b>🛠 Admin</b>\n"
-        "/admin or /admin_help • /grant • /ban • /unban • /broadcast • /backup\n"
-        "/setlevel &lt;user&gt; &lt;level&gt; • /admin_heal &lt;user&gt; • /resetplayer &lt;user&gt;\n\n"
-        "<i>Most actions are also available as inline buttons.</i>"
     )
+    if config.is_admin(update.effective_user.id):
+        text += (
+            "<b>🛠 Admin</b>\n"
+            "/admin or /admin_help • /grant • /ban • /unban • /broadcast • /backup\n"
+            "/setlevel &lt;user&gt; &lt;level&gt; • /admin_heal &lt;user&gt; • /resetplayer &lt;user&gt;\n\n"
+        )
+    text += "<i>Most actions are also available as inline buttons.</i>"
     await respond(update, text, ui.back_keyboard())
 
 
@@ -378,8 +381,9 @@ def profile_text(db: Database, user_id: int) -> str:
     next_exp = db.exp_needed(int(player["level"]))
     collection = game.series_collection(db, user_id)
     collection_text = " • ".join(f"{data.SERIES[s]['emoji']}{collection.get(s, 0)}" for s in data.SERIES_ORDER)
+    avatar = game.avatar_for(player)
     return (
-        f"👤 <b>{ui.esc(player.get('first_name') or player.get('username') or 'Summoner')}</b>\n"
+        f"{avatar['icon']} <b>{ui.esc(player.get('first_name') or player.get('username') or 'Summoner')}</b>\n"
         f"🏅 {ui.esc(player['rank'])} • Level <b>{player['level']}</b>\n"
         f"✨ EXP: {ui.percent_bar(player['exp'], next_exp)} ({ui.fmt(player['exp'])}/{ui.fmt(next_exp)})\n"
         f"🌍 Home: {series_name(player.get('travel', 'dragonball'))}\n"
@@ -392,6 +396,7 @@ def profile_text(db: Database, user_id: int) -> str:
         f"🔮 Element: {data.ELEMENTS[stats['element']]['emoji']} {data.ELEMENTS[stats['element']]['name']}\n\n"
         f"🦸 Main: <b>{ui.esc(stats['name'])}</b>\n"
         f"👥 Team: {team_names}\n"
+        f"👑 Avatar: {avatar['icon']} <b>{ui.esc(avatar['name'])}</b>\n"
         f"🏷️ Title: <b>{ui.esc(title.get('name', 'None'))}</b>\n"
         f"🐾 Companion: <b>{ui.esc(next((p['name'] for p in db.pets(user_id) if p.get('equipped')), 'None'))}</b>\n"
         f"🏯 Clan: <b>{ui.esc(clan['name'] if clan else 'None')}</b>\n\n"
@@ -413,13 +418,16 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         [InlineKeyboardButton("📜 Quests", callback_data="menu:quests"), InlineKeyboardButton("🏆 Rankings", callback_data="menu:leaderboard")],
     ]
     if int(player.get("stat_points", 0) or 0) > 0:
-        rows.append([
+        stat_buttons = [
             InlineKeyboardButton("+STR", callback_data="stat:strength"),
             InlineKeyboardButton("+AGI", callback_data="stat:agility"),
             InlineKeyboardButton("+INT", callback_data="stat:intellect"),
             InlineKeyboardButton("+VIT", callback_data="stat:vitality"),
             InlineKeyboardButton("+LUK", callback_data="stat:luck"),
-        ])
+        ]
+        for index in range(0, len(stat_buttons), 2):
+            rows.append(stat_buttons[index:index + 2])
+    rows.append([InlineKeyboardButton("👑 Crown", callback_data="crown:view"), InlineKeyboardButton("🎴 Heroes", callback_data="chars:all:all:1")])
     rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     keyboard = InlineKeyboardMarkup(rows)
     player = db.require_player(update.effective_user.id)
@@ -462,8 +470,17 @@ async def characters_view(update: Update, context: ContextTypes.DEFAULT_TYPE, ar
     if not page_items:
         lines.append("No heroes match this filter. Summon more with /gacha.")
     for character in page_items:
-        lines.append(ui.char_summary(character))
-        lines.append(f"   <code>{character['id']}</code> • Power {ui.fmt(game.power_score(game.scaled_character(character)))}")
+        rarity_info = data.RARITIES[character["rarity"]]
+        element_info = data.ELEMENTS[character["element"]]
+        power = game.power_score(game.scaled_character(character))
+        lines.append(
+            f"{rarity_info['emoji']} {element_info['emoji']} <b>{ui.esc(character['name'])}</b> "
+            f"Lv.{character['level']} ⭐{character['stars']}"
+        )
+        lines.append(
+            f"   ⚔️ Power <b>{ui.fmt(power)}</b> • 📺 {ui.esc(data.SERIES[character['series']]['name'])}\n"
+            f"   🆔 <code>{character['id']}</code>"
+        )
     lines.extend(["", f"Page {page}/{total_pages} • Use /character &lt;id&gt; for details."])
     buttons = []
     if page > 1:
@@ -538,20 +555,53 @@ async def team_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     characters = db.characters(update.effective_user.id)
     by_id = {character["id"]: character for character in characters}
     team = [cid for cid in db.team(update.effective_user.id) if cid in by_id]
-    lines = ["👥 <b>TEAM BUILDER</b>", f"Slots: {len(team)}/{config.MAX_TEAM}", ""]
-    if team:
-        for index, cid in enumerate(team, 1):
-            character = by_id[cid]
-            lines.append(f"{index}. {data.RARITIES[character['rarity']]['emoji']} <b>{ui.esc(character['name'])}</b> — Lv.{character['level']} • {ui.esc(character['id'])}")
-    else:
-        lines.append("No heroes selected yet.")
-    lines.append("\nTap a hero below to add or remove them. Main hero is the first slot.")
-    rows = []
-    for character in sorted(characters, key=lambda c: (-c["power"], -c["level"]))[:20]:
-        if character["id"] in team:
-            rows.append([InlineKeyboardButton(f"➖ Remove {character['name']}", callback_data=f"team:remove:{character['id']}")])
+    lines = ["👥 <b>ACTIVE BATTLE TEAM</b>", f"Slots: <b>{len(team)}/{config.MAX_TEAM}</b>", ""]
+    combined_power = 0
+    for slot in range(config.MAX_TEAM):
+        if slot < len(team):
+            character = by_id[team[slot]]
+            combined_power += game.power_score(game.scaled_character(character))
+            marker = "🟢" if slot == 0 else "🔵"
+            role = " (Main)" if slot == 0 else ""
+            lines.append(
+                f"{marker} <b>Slot {slot + 1}{role}</b>\n"
+                f"   {data.RARITIES[character['rarity']]['emoji']} <b>{ui.esc(character['name'])}</b> "
+                f"Lv.{character['level']} ⭐{character['stars']} • ⚔️ {ui.fmt(game.power_score(game.scaled_character(character)))}"
+            )
         else:
-            rows.append([InlineKeyboardButton(f"➕ Add {character['name']} (Lv.{character['level']})", callback_data=f"team:add:{character['id']}")])
+            lines.append(f"⚫ <b>Slot {slot + 1}</b> — <i>Empty</i>")
+    lines.append("")
+    lines.append(f"⚔️ <b>Combined Power:</b> {ui.fmt(combined_power)}")
+    lines.append("Use ⬆️ and ⬇️ to swap slots. Slot 1 is your main hero.")
+    lines.append("")
+    lines.append("📋 <b>Your Heroes</b> — tap to add/remove")
+    rows = []
+    for index, cid in enumerate(team, 1):
+        name = by_id[cid]["name"]
+        if index > 1:
+            rows.append([
+                InlineKeyboardButton("⬆️", callback_data=f"team:up:{cid}"),
+                InlineKeyboardButton(f"Slot {index}", callback_data=f"team:view:{cid}"),
+                InlineKeyboardButton("➖", callback_data=f"team:remove:{cid}"),
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton("⭐ Main", callback_data="team:view"),
+                InlineKeyboardButton("⬇️", callback_data=f"team:down:{cid}"),
+                InlineKeyboardButton("➖", callback_data=f"team:remove:{cid}"),
+            ])
+    available = [c for c in sorted(characters, key=lambda c: (-c["power"], -c["level"])) if c["id"] not in team]
+    add_buttons = [
+        InlineKeyboardButton(
+            f"➕ {c['name']} Lv.{c['level']}",
+            callback_data=f"team:add:{c['id']}",
+        )
+        for c in available[:20]
+    ]
+    for index in range(0, len(add_buttons), 2):
+        rows.append(add_buttons[index:index + 2])
+    if not available:
+        lines.append("<i>All owned heroes are already in the team.</i>")
     rows.append([InlineKeyboardButton("🧹 Clear Team", callback_data="team:clear"), InlineKeyboardButton("🎴 Heroes", callback_data="chars:all:all:1")])
     rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
@@ -643,26 +693,81 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     db = get_db(context)
     learned = db.skills(update.effective_user.id)
-    lines = [f"🧠 <b>Skills</b> — {player['skill_points']} skill points", ""]
-    if learned:
-        for skill in learned:
-            status = "✅ equipped" if skill["equipped"] else "⚪ learned"
-            lines.append(f"• <b>{ui.esc(skill['name'])}</b> [{skill['element']}] {status}\n  <code>{skill['id']}</code>")
-    else:
-        lines.append("No skills learned yet.")
-    sample = [skill for skill in data.SKILLS.values() if skill["type"] == "active"][:12]
-    lines.extend(["", "📚 <b>Starter Skill Catalog</b> (use /learn &lt;id&gt;)"])
-    for skill in sample:
-        lines.append(f"• {ui.esc(skill['name'])} — <code>{skill['id']}</code> ({skill['element']}, power x{skill['power']})")
-    lines.append("Tap a skill to equip or unequip it. At most 3 active skills are used in battle.")
+    equipped_count = sum(1 for skill in learned if skill["equipped"])
+    lines = [
+        "🧠 <b>SKILL CODEX</b>",
+        f"🔹 Skill Points: <b>{player['skill_points']}</b> • ✅ Equipped: <b>{equipped_count}/3</b> • 📚 Learned: <b>{len(learned)}</b>",
+        "",
+    ]
+
+    def add_grouped(skills: list[dict], title: str) -> None:
+        if not skills:
+            return
+        lines.append(title)
+        grouped: dict[str, list[dict]] = {tag: [] for tag in game.SKILL_TAG_ORDER}
+        for skill in skills:
+            tags = game.skill_tags(skill)
+            grouped.setdefault(tags[0], []).append(skill)
+        tag_icons = {
+            "REGENERATION": "💚", "DEFENSE": "🛡️", "LUCK": "🍀",
+            "DROP RATE": "💰", "PULL RATE": "🎟️", "ATTACK": "⚔️",
+        }
+        for tag in game.SKILL_TAG_ORDER:
+            group = grouped.get(tag, [])
+            if not group:
+                continue
+            lines.append(f"{tag_icons.get(tag, '•')} <b>{tag}</b>")
+            for skill in group:
+                status = "✅" if skill.get("equipped") else "⚪"
+                cost = int(skill.get("cost", 0) or 0)
+                cost_text = f" • {cost} MP" if skill.get("type") == "active" and cost else ""
+                all_tags = " • ".join(game.skill_tags(skill))
+                lines.append(
+                    f"{status} <b>{ui.esc(skill['name'])}</b> "
+                    f"[{ui.esc(str(skill['element']).upper())}]{cost_text} • {ui.esc(all_tags)}\n"
+                    f"   {ui.esc(game.skill_effect(skill))} • <code>{skill['id']}</code>"
+                )
+            lines.append("")
+
+    add_grouped(learned, "📖 <b>Your Learned Skills</b>")
+    if not learned:
+        lines.append("No skills learned yet. Learn one from the catalog below.")
+        lines.append("")
+    learned_ids = {skill["id"] for skill in learned}
+    catalog = [skill for skill in data.SKILLS.values() if skill.get("type") == "active" and skill["id"] not in learned_ids]
+    sample: list[dict] = []
+    seen_tags: set[str] = set()
+    for skill in catalog:
+        primary = game.skill_tags(skill)[0]
+        if primary not in seen_tags:
+            sample.append(skill)
+            seen_tags.add(primary)
+        if len(sample) >= 8:
+            break
+    if len(sample) < 8:
+        for skill in catalog:
+            if skill not in sample:
+                sample.append(skill)
+            if len(sample) >= 8:
+                break
+    add_grouped(sample, "📚 <b>Skill Catalog</b> — tap to learn")
+    lines.append("At most <b>3</b> active skills can be equipped for battle.")
     rows = []
-    for skill in learned:
-        rows.append([InlineKeyboardButton(
+    equip_buttons = [
+        InlineKeyboardButton(
             ("✅ " if skill["equipped"] else "⚪ ") + skill["name"],
             callback_data=f"skill:equip:{skill['id']}",
-        )])
-    for skill in sample[:6]:
-        rows.append([InlineKeyboardButton(f"📚 Learn {skill['name']}", callback_data=f"skill:learn:{skill['id']}")])
+        )
+        for skill in learned
+    ]
+    for index in range(0, len(equip_buttons), 2):
+        rows.append(equip_buttons[index:index + 2])
+    learn_buttons = [
+        InlineKeyboardButton(f"📚 {skill['name']}", callback_data=f"skill:learn:{skill['id']}")
+        for skill in sample
+    ]
+    for index in range(0, len(learn_buttons), 2):
+        rows.append(learn_buttons[index:index + 2])
     rows.append([InlineKeyboardButton("🛒 Skill Shop", callback_data="menu:skillshop"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
@@ -2241,7 +2346,7 @@ async def cmd_pic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         clan = db.clan(player["user_id"])
         path = images.profile_card(player, stats, len(db.characters(player["user_id"])), len(db.pets(player["user_id"])), clan)
         caption = f"👤 {ui.esc(player.get('first_name') or 'Summoner')} — {stats['rank']}"
-        art_type, art_key = "profile", str(player["user_id"])
+        art_type, art_key = "profile", f"avatar_{player.get('avatar') or 'rookie'}"
     elif kind in ("clan", "guild"):
         clan = db.clan(player["user_id"])
         if clan is None:
@@ -2308,6 +2413,8 @@ async def cmd_pic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await respond(update, "Usage: /pic [profile|clan|character|boss|summon|npc|gear|item|chapter] [name/id]")
         return
     art = db.art_get(art_type, art_key) if art_type and art_key else None
+    if art is None and art_type == "profile":
+        art = db.art_get("profile", str(player["user_id"]))
     if art and art.get("file_id"):
         await send_file_id(update, art["file_id"], caption)
         return
@@ -2489,7 +2596,7 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 ART_TYPES = ("character", "npc", "boss", "summon", "world", "clanraid", "pet", "map", "chapter", "clan", "profile")
 
 
-def _art_catalog() -> dict[str, dict[str, dict]]:
+def _art_catalog(db: Database | None = None) -> dict[str, dict[str, dict]]:
     catalog: dict[str, dict[str, dict]] = {key: {} for key in ART_TYPES}
     for char_id, char in data.CHARACTERS.items():
         catalog["character"][char_id] = {"name": char["name"], "id": char_id}
@@ -2515,14 +2622,20 @@ def _art_catalog() -> dict[str, dict[str, dict]]:
     for series, chapters in data.CHAPTERS.items():
         for chapter in chapters:
             catalog["chapter"][chapter["id"]] = {"name": chapter["name"], "id": chapter["id"]}
+    for avatar_id, avatar in data.PROFILE_AVATARS.items():
+        catalog["profile"][f"avatar_{avatar_id}"] = {"name": f"{avatar['name']} Avatar", "id": avatar_id}
+    if db is not None:
+        for clan in db.clan_leaderboard(500):
+            key = str(clan.get("tag") or clan["id"]).lower()
+            catalog["clan"][key] = {"name": f"{clan['name']} [{clan['tag']}]", "id": key}
     return catalog
 
 
-def _resolve_art_target(query: str, forced_type: str | None = None) -> tuple[str, str, str] | None:
+def _resolve_art_target(query: str, forced_type: str | None = None, db: Database | None = None) -> tuple[str, str, str] | None:
     query = query.strip()
     if not query:
         return None
-    catalog = _art_catalog()
+    catalog = _art_catalog(db)
     types = [forced_type] if forced_type in catalog else list(catalog)
     key = query.lower().replace(" ", "_")
     for entity_type in types:
@@ -2638,32 +2751,119 @@ async def cmd_crown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if player is None:
         return
     db = get_db(context)
-    catalog = _art_catalog()
+    user_id = update.effective_user.id
+    level = int(player.get("level", 1))
+    avatar = game.avatar_for(player)
+    unlocked = [key for key, item in data.PROFILE_AVATARS.items() if level >= int(item["level"])]
+    clan = db.clan(user_id)
+    all_clans = db.clan_leaderboard(20)
+    joinable = [
+        item for item in all_clans
+        if (not clan or int(item["id"]) != int(clan["id"]))
+        and level >= int(item.get("min_level", 1))
+        and (int(item.get("open_join", 1)) or db.clan_invite_pending(int(item["id"]), int(user_id)))
+    ]
+    lines = [
+        "👑 <b>CROWN — PROFILE & CLAN HALL</b>",
+        f"{avatar['icon']} Avatar: <b>{ui.esc(avatar['name'])}</b> • Unlocked: <b>{len(unlocked)}/{len(data.PROFILE_AVATARS)}</b>",
+        f"🏯 Clan: <b>{ui.esc(clan['name']) if clan else 'None'}</b>"
+        + (f" • {ui.esc(game.clan_bonus_text(clan))}" if clan else ""),
+        f"🚪 Joinable clans: <b>{len(joinable)}</b>",
+        "",
+        "🎭 <b>AVATARS</b> — tap to equip",
+    ]
+    for key, item in data.PROFILE_AVATARS.items():
+        unlocked_avatar = level >= int(item["level"])
+        selected = key == (player.get("avatar") or "rookie")
+        marker = "✅" if selected else ("🔓" if unlocked_avatar else "🔒")
+        requirement = f" • Lv.{item['level']}" if not unlocked_avatar else ""
+        lines.append(f"{marker} {item['icon']} <b>{ui.esc(item['name'])}</b>{requirement}")
+    lines.extend(["", "🏯 <b>CLANS</b>"])
+    if clan:
+        info = db.clan_info(int(clan["id"]))
+        members = len(info["members"]) if info else 0
+        lines.append(f"✅ <b>{ui.esc(clan['name'])}</b> [{ui.esc(clan['tag'])}] • Lv.{clan.get('level', 1)} • {members}/30 members")
+    else:
+        lines.append("<i>You are not in a clan yet.</i>")
+    if joinable:
+        for item in joinable[:5]:
+            lines.append(
+                f"• <b>{ui.esc(item['name'])}</b> [{ui.esc(item['tag'])}] • Lv.{item.get('level', 1)} • "
+                f"{item.get('members', 0)}/30 • {ui.esc(game.clan_bonus_text(item))}"
+            )
+    elif not clan:
+        lines.append("<i>No open clans match your level. Create one below.</i>")
+    is_admin = config.is_admin(update.effective_user.id)
+    if is_admin:
+        lines.extend([
+            "",
+            "🖼️ <b>Custom Art</b>",
+        ])
+        total_uploads = sum(len(db.art_keys(entity_type)) for entity_type in ART_TYPES)
+        lines.append(f"Uploaded custom images: <b>{total_uploads}</b> • Reply to a photo with <code>/upload NAME</code>")
+    else:
+        lines.extend(["", "<i>Custom art tools are available to admins only.</i>"])
+    rows = []
+    avatar_buttons = [
+        InlineKeyboardButton(
+            ("✅ " if key == (player.get("avatar") or "rookie") else ("🔓 " if level >= int(item["level"]) else "🔒 ")) + f"{item['icon']} {item['name']}",
+            callback_data=f"crown:avatar:{key}",
+        )
+        for key, item in data.PROFILE_AVATARS.items()
+    ]
+    for index in range(0, len(avatar_buttons), 2):
+        rows.append(avatar_buttons[index:index + 2])
+    for item in joinable[:4]:
+        rows.append([InlineKeyboardButton(
+            f"🏯 Join {item['name']} [{item['tag']}]",
+            callback_data=f"crown:clan:{item['tag']}",
+        )])
+    if is_admin:
+        rows.append([InlineKeyboardButton("🏯 Clan Menu", callback_data="menu:clan"), InlineKeyboardButton("🖼️ Manage Art", callback_data="crown:art")])
+    else:
+        rows.append([InlineKeyboardButton("🏯 Clan Menu", callback_data="menu:clan"), InlineKeyboardButton("🎴 Heroes", callback_data="chars:all:all:1")])
+    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def crown_art_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not config.is_admin(update.effective_user.id if update.effective_user else None):
+        await respond(update, "🔒 Custom art tools are available to admins only.")
+        return
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    catalog = _art_catalog(db)
     labels = {
         "character": "🎴 Heroes", "npc": "👹 NPCs", "boss": "👑 Bosses", "summon": "🌌 Summons",
         "world": "🌍 World Bosses", "clanraid": "🏯 Clan Raids", "pet": "🐾 Pets", "map": "🗺️ Maps",
         "chapter": "📖 Chapters", "clan": "🏯 Clans", "profile": "👤 Profiles",
     }
-    lines = ["👑 <b>CROWN — DYNAMIC ART MANAGER</b>", "Add custom art to any entity. Upload progress is saved per entity.", ""]
-    rows = []
+    lines = ["👑 <b>CROWN — DYNAMIC ART MANAGER</b>", "Add custom art to any entity.", ""]
     for entity_type, entries in catalog.items():
         uploaded = len(db.art_keys(entity_type))
-        lines.append(f"{labels.get(entity_type, entity_type.title())}: <b>{uploaded}</b>/{len(entries)} uploaded")
+        if entries:
+            lines.append(f"{labels.get(entity_type, entity_type.title())}: <b>{uploaded}</b> uploaded • {len(entries)} slots")
     lines.extend([
         "",
         "Reply to a photo with: <code>/upload NAME</code>",
         "Example: <code>/upload Frieza</code> or <code>/upload boss Frieza</code>",
         "Use <code>/pic &lt;type&gt; &lt;name&gt;</code> to preview. Custom art overrides generated cards.",
     ])
-    rows.append([InlineKeyboardButton("🎴 Heroes", callback_data="art:list:character"), InlineKeyboardButton("👹 NPCs", callback_data="art:list:npc")])
-    rows.append([InlineKeyboardButton("👑 Bosses", callback_data="art:list:boss"), InlineKeyboardButton("🌌 Summons", callback_data="art:list:summon")])
-    rows.append([InlineKeyboardButton("🗺️ Maps", callback_data="art:list:map"), InlineKeyboardButton("🐾 Pets", callback_data="art:list:pet")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    art_buttons = [
+        InlineKeyboardButton(labels.get(entity_type, entity_type.title()), callback_data=f"art:list:{entity_type}")
+        for entity_type in ART_TYPES
+    ]
+    rows = []
+    for index in range(0, len(art_buttons), 2):
+        rows.append(art_buttons[index:index + 2])
+    rows.append([InlineKeyboardButton("⬅️ Crown", callback_data="crown:view"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    player = await guard(update, context)
+    player = await guard_admin(update, context)
     if player is None:
         return
     db = get_db(context)
@@ -2689,7 +2889,7 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         forced_type = args[0].lower()
         args = args[1:]
     query = " ".join(args).strip()
-    target = _resolve_art_target(query, forced_type)
+    target = _resolve_art_target(query, forced_type, db)
     if target is None:
         await respond(update, f"❌ No art target matches <b>{ui.esc(query)}</b>. Try /crown for valid types or use <code>/upload boss NAME</code>.")
         return
@@ -2738,11 +2938,22 @@ async def post_init(application: Application) -> None:
     application.bot_data["db"] = db
     logger.info("Database ready at %s", config.DB_PATH)
     logger.info("Loaded %d characters, %d gear, %d skills", len(data.CHARACTERS), len(data.GEAR), len(data.SKILLS))
+    public_commands = [BotCommand(name, desc) for name, desc in COMMANDS]
     try:
-        await application.bot.set_my_commands([BotCommand(name, desc) for name, desc in COMMANDS])
-        logger.info("Registered %d commands", len(COMMANDS))
+        await application.bot.set_my_commands(public_commands)
+        logger.info("Registered %d public commands", len(public_commands))
     except TelegramError as exc:
-        logger.warning("Could not set commands: %s", exc)
+        logger.warning("Could not set public commands: %s", exc)
+    if config.ADMIN_IDS:
+        admin_commands = public_commands + [BotCommand(name, desc) for name, desc in ADMIN_COMMANDS]
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await application.bot.set_my_commands(
+                    admin_commands,
+                    scope=BotCommandScopeChat(chat_id=admin_id),
+                )
+            except TelegramError as exc:
+                logger.warning("Could not set admin commands for %s: %s", admin_id, exc)
     username = application.bot.username or "unknown"
     logger.info("Connected to Telegram as @%s", username)
 
@@ -2761,6 +2972,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("profile", "Profile, power and currencies"),
     ("register", "Choose your home series"),
     ("characters", "Browse your heroes"),
+    ("chars", "Alias for /characters"),
     ("character", "Inspect a hero"),
     ("team", "Set your 3-hero team"),
     ("equipchar", "Set your main hero"),
@@ -2831,13 +3043,11 @@ COMMANDS: list[tuple[str, str]] = [
     ("weekly", "Claim weekly reward"),
     ("monthly", "Claim monthly reward"),
     ("travel", "Change home series"),
-    ("crown", "Dynamic art manager"),
+    ("crown", "Profile avatar, clan hall, and art"),
     ("chapters", "View story chapters"),
     ("chapter", "Fight a story chapter"),
-    ("admin_heal", "Admin: fully heal a player"),
     ("inv", "Open inventory"),
     ("top", "Open rankings"),
-    ("admin_help", "Admin help panel"),
     ("pets", "Companion collection"),
     ("pet_equip", "Equip a companion"),
     ("pet_feed", "Feed and level a companion"),
@@ -2846,7 +3056,12 @@ COMMANDS: list[tuple[str, str]] = [
     ("fish", "Fish for materials"),
     ("mine", "Mine for ore and crystals"),
     ("about", "About the bot"),
+]
+
+ADMIN_COMMANDS: list[tuple[str, str]] = [
     ("upload", "Upload custom art by replying to a photo"),
+    ("admin_heal", "Admin: fully heal a player"),
+    ("admin_help", "Admin help panel"),
     ("admin", "Admin panel"),
     ("grant", "Admin: grant any asset"),
     ("ban", "Admin: ban player"),
@@ -2867,6 +3082,8 @@ HANDLERS = {
     "profile": cmd_profile,
     "stats": cmd_profile,
     "characters": cmd_characters,
+    "chars": cmd_characters,
+    "cnaracters": cmd_characters,
     "character": cmd_character,
     "team": cmd_team,
     "equipchar": cmd_equipchar,
@@ -3191,6 +3408,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             db.set_team(update.effective_user.id, [])
             await team_view(update, context)
             return
+        if action in ("up", "down") and len(parts) > 2:
+            char_id = parts[2]
+            team = [cid for cid in db.team(update.effective_user.id) if cid in {c["id"] for c in db.characters(update.effective_user.id)}]
+            if char_id in team:
+                index = team.index(char_id)
+                target = max(0, index - 1) if action == "up" else min(len(team) - 1, index + 1)
+                team[index], team[target] = team[target], team[index]
+                db.set_team(update.effective_user.id, team)
+            await team_view(update, context)
+            return
         if action in ("add", "remove") and len(parts) > 2:
             char_id = parts[2]
             team = [cid for cid in db.team(update.effective_user.id)]
@@ -3317,22 +3544,92 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await cmd_profile(update, context)
         return
-    if key == "art" and len(parts) > 2 and parts[1] == "list":
+    if key == "crown":
         player = await guard(update, context)
         if player is None:
             return
+        action = parts[1] if len(parts) > 1 else "view"
+        db = get_db(context)
+        if action == "view":
+            await cmd_crown(update, context)
+            return
+        if action == "art":
+            await crown_art_view(update, context)
+            return
+        if action == "avatar" and len(parts) > 2:
+            avatar_id = parts[2]
+            avatar = data.PROFILE_AVATARS.get(avatar_id)
+            if avatar is None:
+                await respond(update, "❌ Unknown avatar.", ui.back_keyboard("crown:view"))
+                return
+            if int(player.get("level", 1)) < int(avatar["level"]):
+                await respond(
+                    update,
+                    f"🔒 Reach level {avatar['level']} to unlock {avatar['icon']} <b>{ui.esc(avatar['name'])}</b>.",
+                    ui.back_keyboard("crown:view"),
+                )
+                return
+            db.set_field(update.effective_user.id, "avatar", avatar_id)
+            await cmd_crown(update, context)
+            return
+        if action == "clan" and len(parts) > 2:
+            result = db.join_clan(update.effective_user.id, parts[2])
+            if not result["ok"]:
+                await respond(update, f"❌ {ui.esc(result['reason'])}", ui.back_keyboard("crown:view"))
+                return
+            await cmd_crown(update, context)
+            return
+        await cmd_crown(update, context)
+        return
+    if key == "art" and len(parts) > 2 and parts[1] == "list":
+        if not config.is_admin(update.effective_user.id if update.effective_user else None):
+            await respond(update, "🔒 Custom art tools are available to admins only.")
+            return
+        player = await guard(update, context)
+        if player is None:
+            return
+        db = get_db(context)
         entity_type = parts[2]
-        rows = get_db(context).art_list(entity_type)
-        labels = {"character": "Heroes", "npc": "NPCs", "boss": "Bosses", "summon": "Summons", "world": "World Bosses", "clanraid": "Clan Raids", "pet": "Pets", "map": "Maps", "chapter": "Chapters"}
-        lines = [f"👑 <b>CUSTOM ART — {labels.get(entity_type, entity_type.title())}</b>", ""]
-        if rows:
-            for row in rows[:40]:
-                lines.append(f"• <b>{ui.esc(row['name'])}</b> — <code>{row['entity_key']}</code>")
-            lines.append("\nPreview with /pic " + entity_type + " <name>.")
+        if entity_type not in ART_TYPES:
+            await respond(update, "❌ Unknown art category.", ui.back_keyboard("crown:art"))
+            return
+        labels = {
+            "character": "Heroes", "npc": "NPCs", "boss": "Bosses", "summon": "Summons",
+            "world": "World Bosses", "clanraid": "Clan Raids", "pet": "Pets", "map": "Maps",
+            "chapter": "Chapters", "clan": "Clans", "profile": "Profiles",
+        }
+        catalog = _art_catalog(db).get(entity_type, {})
+        uploaded = db.art_keys(entity_type)
+        entries = sorted(catalog.items(), key=lambda item: item[1].get("name", "").lower())
+        page = max(1, int(parts[3])) if len(parts) > 3 and parts[3].isdigit() else 1
+        per_page = 30
+        total_pages = max(1, (len(entries) + per_page - 1) // per_page)
+        page = min(page, total_pages)
+        page_entries = entries[(page - 1) * per_page:page * per_page]
+        have_count = sum(1 for key, _ in entries if key in uploaded)
+        lines = [
+            f"👑 <b>CROWN · {labels.get(entity_type, entity_type.title()).upper()}</b>",
+            f"✅ Uploaded: <b>{have_count}</b> • 📦 Slots: <b>{len(entries)}</b> • Page {page}/{total_pages}",
+            "",
+        ]
+        if page_entries:
+            for key, entry in page_entries:
+                marker = "✅" if key in uploaded else "❌"
+                lines.append(f"{marker} {ui.esc(entry.get('name', key))} — <code>{ui.esc(key)}</code>")
+            lines.append("")
+            lines.append("Reply to a photo with <code>/upload TYPE NAME</code> to add art.")
+            lines.append("Preview with <code>/pic TYPE NAME</code>.")
         else:
-            lines.append("No custom art uploaded yet.")
-            lines.append("Reply to a photo with /upload NAME.")
-        await respond(update, "\n".join(lines), ui.back_keyboard("menu:crown"))
+            lines.append("No art slots exist for this category yet.")
+            lines.append("Create the entity or clan first, then upload art.")
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"art:list:{entity_type}:{page - 1}"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"art:list:{entity_type}:{page + 1}"))
+        rows = [nav] if nav else []
+        rows.append([InlineKeyboardButton("🖼️ Crown Art", callback_data="crown:art"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+        await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
         return
     if key == "boss":
         player = await guard(update, context)
