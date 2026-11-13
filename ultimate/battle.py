@@ -159,7 +159,7 @@ def _dragonball_drop(db, user_id: int, chance: float) -> dict:
     return {}
 
 
-def start_hunt(db, user_id: int, series: str | None = None) -> dict:
+def start_hunt(db, user_id: int, series: str | None = None, npc_id: str | None = None) -> dict:
     battle = _resume(db, user_id)
     if battle:
         return {"ok": True, "battle": battle, "resumed": True}
@@ -170,7 +170,9 @@ def start_hunt(db, user_id: int, series: str | None = None) -> dict:
     series = series if series in data.SERIES else player.get("travel", "dragonball")
     npcs = data.NPCS.get(series) or data.NPCS["dragonball"]
     limit = max(1, min(len(npcs), 1 + int(player["level"]) // 12))
-    npc = random.choice(npcs[:limit])
+    npc = next((item for item in npcs if item["id"] == npc_id), None) if npc_id else None
+    if npc is None:
+        npc = random.choice(npcs[:limit])
     db.spend(user_id, stamina=8)
     enemy = _enemy(npc["name"], game.enemy_from_npc(npc), level=npc["level"], art="npc", art_key=npc["id"])
     rewards = {"yens": npc["yens"], "exp": npc["exp"], "gems": npc["gems"]}
@@ -428,7 +430,7 @@ def start_arena(db, user_id: int) -> dict:
 def start(db, user_id: int, mode: str, **kwargs) -> dict:
     mode = (mode or "").lower()
     if mode == "hunt":
-        return start_hunt(db, user_id, kwargs.get("series"))
+        return start_hunt(db, user_id, kwargs.get("series"), kwargs.get("npc_id"))
     if mode == "boss":
         return start_boss(db, user_id, kwargs.get("series"), kwargs.get("boss_id"))
     if mode == "elite":

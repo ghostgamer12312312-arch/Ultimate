@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import shutil
 import sqlite3
 import time
@@ -277,8 +278,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "📖 <b>COMMAND GUIDE</b>\n\n"
         "<b>⚔️ Combat & Progression</b>\n"
-        "/hunt [series] — hunt an NPC\n/npc [series] — view NPC zones\n"
-        "/boss [series] — fight a persistent series boss\n/elite — elite hunt\n/streak — NPC streak\n"
+        "/hunt [series] — preview an NPC, then Battle or Flee\n/npc [series] — view NPC zones\n"
+        "/boss [series] — choose a persistent series boss\n/elite — elite hunt\n/streak — NPC streak\n"
         "/raid or /global — world boss info\n/attack — attack the world boss\n"
         "/summonboss [series|boss_id] — summon and damage a persistent boss\n"
         "/clanraid [start|attack|info] — clan raid\n/arena — random PvP duel\n/duel &lt;id|@user&gt; — challenge a player\n\n"
@@ -1055,9 +1056,57 @@ async def cmd_enhance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await respond(update, f"⚙️ Gear enhanced to level <b>{result['level']}</b> for 💠 {ui.fmt(result['cost'])} yens.")
 
 
+def hunt_candidate(db: Database, user_id: int, series: str, npc_query: str | None = None) -> dict:
+    player = db.require_player(user_id)
+    npcs = data.NPCS.get(series) or data.NPCS["dragonball"]
+    if npc_query:
+        found = next((npc for npc in npcs if npc["id"].lower() == npc_query.lower()), None)
+        found = found or next((npc for npc in npcs if npc_query.lower() in npc["name"].lower()), None)
+        if found is not None:
+            return found
+    limit = max(1, min(len(npcs), 1 + int(player["level"]) // 12))
+    return random.choice(npcs[:limit])
+
+
+async def hunt_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    args = list(context.args)
+    series = parse_series(args[0]) if args and parse_series(args[0]) else player.get("travel", "dragonball")
+    npc_query = args[1] if args and parse_series(args[0]) and len(args) > 1 else (args[0] if args and not parse_series(args[0]) else None)
+    npc = hunt_candidate(db, update.effective_user.id, series, npc_query)
+    info = data.SERIES[series]
+    stamina = int(player["stamina"])
+    lines = [
+        f"{info['emoji']} <b>HUNT — {ui.esc(info['home'])}</b>",
+        "",
+        f"👹 <b>{ui.esc(npc['name'])}</b> Lv.{npc['level']}",
+        f"{data.ELEMENTS[npc['element']]['emoji']} Element: {npc['element'].title()}",
+        f"❤️ HP: {ui.fmt(npc['hp'])} • ⚔️ ATK: {ui.fmt(npc['atk'])} • 🛡️ DEF: {ui.fmt(npc['def'])}",
+        f"🎁 Reward: {ui.fmt(npc['exp'])} EXP • {ui.fmt(npc['yens'])} yens • {npc['gems']} gems",
+        "",
+        f"⚡ Stamina: {stamina}/{player['max_stamina']} • Cost: 8",
+        "",
+        "Do you want to battle this NPC?",
+    ]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚔️ Battle NPC", callback_data=f"hunt:fight:{series}:{npc['id']}")],
+        [InlineKeyboardButton("🎲 Find Another", callback_data=f"hunt:reroll:{series}"), InlineKeyboardButton("🏃 Flee", callback_data="hunt:flee")],
+        [InlineKeyboardButton("👹 Bosses", callback_data=f"boss:view:{series}"), InlineKeyboardButton("🌍 Travel", callback_data="menu:travel")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+    ])
+    await respond(update, "\n".join(lines), keyboard)
+
+
 async def cmd_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    series = parse_series(context.args[0]) if context.args else None
-    await start_battle(update, context, "hunt", series=series)
+    if context.args and context.args[0].lower() in ("start", "fight", "random"):
+        context.args = context.args[1:]
+        series = parse_series(context.args[0]) if context.args else None
+        await start_battle(update, context, "hunt", series=series)
+        return
+    await hunt_view(update, context)
 
 
 async def cmd_adventure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1071,13 +1120,41 @@ async def cmd_npc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [f"🗺️ <b>{series_name(series)} Hunting Zones</b>", ""]
     for npc in data.NPCS[series]:
         lines.append(f"👹 <b>{ui.esc(npc['name'])}</b> — Lv.{npc['level']} • {data.ELEMENTS[npc['element']]['emoji']} • {ui.fmt(npc['hp'])} HP")
-    lines.append("\nUse /hunt &lt;series&gt; to fight a random zone enemy.")
+    lines.append("\nUse /hunt &lt;series&gt; to preview a zone enemy, then tap Battle or Flee.")
     await respond(update, "\n".join(lines), ui.back_keyboard())
 
 
+async def boss_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    args = list(context.args)
+    series = parse_series(args[0]) if args and parse_series(args[0]) else player.get("travel", "dragonball")
+    bosses = data.BOSSES.get(series, [])
+    info = data.SERIES[series]
+    lines = [
+        f"{info['emoji']} <b>BOSSES — {ui.esc(info['home'])}</b>",
+        "",
+        f"⚡ Stamina: {player['stamina']} • Boss Key required: {get_db(context).item_qty(update.effective_user.id, 'boss_key')}",
+        "",
+        "Choose a boss to inspect, or flee from the hunt.",
+    ]
+    rows = []
+    for boss in bosses[:6]:
+        lines.append(f"👹 <b>{ui.esc(boss['name'])}</b> Lv.{boss['level']} • {data.ELEMENTS[boss['element']]['emoji']}")
+        rows.append([InlineKeyboardButton(f"⚔️ Battle {boss['name']} Lv.{boss['level']}", callback_data=f"boss:fight:{series}:{boss['id']}")])
+    rows.append([InlineKeyboardButton("🏃 Flee", callback_data="boss:flee"), InlineKeyboardButton("🌍 Travel", callback_data="menu:travel")])
+    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
 async def cmd_boss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    series = parse_series(context.args[0]) if context.args else None
-    await start_battle(update, context, "boss", series=series)
+    if context.args and context.args[0].lower() in ("start", "fight", "random"):
+        context.args = context.args[1:]
+        series = parse_series(context.args[0]) if context.args else None
+        await start_battle(update, context, "boss", series=series)
+        return
+    await boss_view(update, context)
 
 
 async def cmd_elite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2476,9 +2553,9 @@ async def cmd_explore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     ]
     for npc in npcs[:6]:
         lines.append(f"• {ui.esc(npc['name'])} — Lv.{npc['level']} • {data.ELEMENTS[npc['element']]['emoji']} • {ui.fmt(npc['hp'])} HP")
-    lines.append("\nTap Fight to start a manual turn-based battle.")
+    lines.append("\nTap Hunt Preview to inspect an enemy and choose Battle or Flee.")
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚔️ Fight", callback_data=f"battle:start:hunt:{series}"), InlineKeyboardButton("🗺️ NPC List", callback_data="menu:npc")],
+        [InlineKeyboardButton("⚔️ Hunt Preview", callback_data=f"hunt:reroll:{series}"), InlineKeyboardButton("🗺️ NPC List", callback_data="menu:npc")],
         [InlineKeyboardButton("🌍 Travel", callback_data="menu:travel"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ])
     await respond(update, "\n".join(lines), keyboard)
@@ -3256,6 +3333,42 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             lines.append("No custom art uploaded yet.")
             lines.append("Reply to a photo with /upload NAME.")
         await respond(update, "\n".join(lines), ui.back_keyboard("menu:crown"))
+        return
+    if key == "boss":
+        player = await guard(update, context)
+        if player is None:
+            return
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "flee":
+            await respond(update, "🏃 You left the boss hunt. No stamina was used.", ui.main_menu_keyboard())
+            return
+        if action == "view" and len(parts) > 2:
+            context.args = [parts[2]]
+            await boss_view(update, context)
+            return
+        if action == "fight" and len(parts) > 3:
+            await start_battle(update, context, "boss", series=parts[2], boss_id=parts[3])
+            return
+        context.args = []
+        await boss_view(update, context)
+        return
+    if key == "hunt":
+        player = await guard(update, context)
+        if player is None:
+            return
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "flee":
+            await respond(update, "🏃 You fled from the encounter. No stamina was used.", ui.main_menu_keyboard())
+            return
+        if action == "reroll" and len(parts) > 2:
+            context.args = [parts[2]]
+            await hunt_view(update, context)
+            return
+        if action == "fight" and len(parts) > 3:
+            await start_battle(update, context, "hunt", series=parts[2], npc_id=parts[3])
+            return
+        context.args = []
+        await hunt_view(update, context)
         return
     if key == "ach" and len(parts) > 1 and parts[1] == "claim":
         await cmd_claimach(update, context)
