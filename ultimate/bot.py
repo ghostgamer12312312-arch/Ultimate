@@ -3090,21 +3090,29 @@ async def post_init(application: Application) -> None:
     logger.info("Database ready at %s", config.DB_PATH)
     logger.info("Loaded %d characters, %d gear, %d skills", len(data.CHARACTERS), len(data.GEAR), len(data.SKILLS))
     public_commands = [BotCommand(name, desc) for name, desc in COMMANDS]
-    try:
-        await application.bot.set_my_commands(public_commands)
-        logger.info("Registered %d public commands", len(public_commands))
-    except TelegramError as exc:
-        logger.warning("Could not set public commands: %s", exc)
+    for attempt in range(3):
+        try:
+            await application.bot.set_my_commands(public_commands)
+            logger.info("Registered %d public commands", len(public_commands))
+            break
+        except TelegramError as exc:
+            logger.warning("Could not set public commands (attempt %d): %s", attempt + 1, exc)
+            await asyncio.sleep(2)
     if config.ADMIN_IDS:
         admin_commands = public_commands + [BotCommand(name, desc) for name, desc in ADMIN_COMMANDS]
+        admin_commands = admin_commands[:100]
         for admin_id in config.ADMIN_IDS:
-            try:
-                await application.bot.set_my_commands(
-                    admin_commands,
-                    scope=BotCommandScopeChat(chat_id=admin_id),
-                )
-            except TelegramError as exc:
-                logger.warning("Could not set admin commands for %s: %s", admin_id, exc)
+            for attempt in range(3):
+                try:
+                    await application.bot.set_my_commands(
+                        admin_commands,
+                        scope=BotCommandScopeChat(chat_id=admin_id),
+                    )
+                    logger.info("Registered %d admin menu commands for %s", len(admin_commands), admin_id)
+                    break
+                except TelegramError as exc:
+                    logger.warning("Could not set admin commands for %s (attempt %d): %s", admin_id, attempt + 1, exc)
+                    await asyncio.sleep(2)
     username = application.bot.username or "unknown"
     logger.info("Connected to Telegram as @%s", username)
 
@@ -3212,7 +3220,6 @@ COMMANDS: list[tuple[str, str]] = [
 ADMIN_COMMANDS: list[tuple[str, str]] = [
     ("upload", "Upload custom art by replying to a photo"),
     ("admin_heal", "Admin: fully heal a player"),
-    ("admin_help", "Admin help panel"),
     ("admin", "Admin panel"),
     ("grant", "Admin: grant any asset"),
     ("ban", "Admin: ban player"),
