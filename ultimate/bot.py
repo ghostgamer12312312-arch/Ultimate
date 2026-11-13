@@ -249,10 +249,32 @@ def main_menu_text(player: dict) -> str:
     )
 
 
+async def send_telegram_avatar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return
+    try:
+        photos = await context.bot.get_user_profile_photos(user.id, limit=1)
+    except (TelegramError, AttributeError, TypeError):
+        return
+    if not getattr(photos, "total_count", 0):
+        return
+    try:
+        await message.reply_photo(
+            photo=photos.photos[0][-1].file_id,
+            caption=f"👤 <b>{ui.esc(user.first_name or user.username or 'Summoner')}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except (BadRequest, TelegramError):
+        return
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     player = await guard(update, context)
     if player is None:
         return
+    await send_telegram_avatar(update, context)
     text = (
         f"🐉 <b>WELCOME TO {ui.esc(config.GAME_NAME)}</b> 🐉\n\n"
         f"Choose your home series and begin your journey. Each week brings new banners, "
@@ -313,15 +335,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/chapters [series] • /chapter [series] [number] — story battles\n"
         "/explore — tap-through battle map • /heal — heal from a menu\n"
         "/inv — inventory buttons • /top — rankings • /unstuck — clear a stuck battle\n"
-        "/pity — gacha pity • /element — element chart • /crown — art manager\n"
+        "/pity — gacha pity • /element — element chart • /crown — avatars and clan hall\n"
         "/pic [profile|clan|character|boss|summon|npc|gear|item|chapter] [name/id]\n"
-        "/upload TYPE NAME — reply to a photo to save custom art\n"
         "/banner • /settings • /about • /myid\n\n"
     )
     if config.is_admin(update.effective_user.id):
         text += (
             "<b>🛠 Admin</b>\n"
             "/admin or /admin_help • /grant • /ban • /unban • /broadcast • /backup\n"
+            "/crownart — hidden custom art manager • /upload TYPE NAME\n"
             "/setlevel &lt;user&gt; &lt;level&gt; • /admin_heal &lt;user&gt; • /resetplayer &lt;user&gt;\n\n"
         )
     text += "<i>Most actions are also available as inline buttons.</i>"
@@ -411,6 +433,7 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     player = await guard(update, context)
     if player is None:
         return
+    await send_telegram_avatar(update, context)
     db = get_db(context)
     rows = [
         [InlineKeyboardButton("🎴 Summon", callback_data="menu:gacha"), InlineKeyboardButton("⚔️ Hunt", callback_data="menu:hunt")],
@@ -458,20 +481,31 @@ async def characters_view(update: Update, context: ContextTypes.DEFAULT_TYPE, ar
                 series = parsed
     owned = db.characters(update.effective_user.id)
     filtered = [c for c in owned if (not series or c["series"] == series) and (not rarity or c["rarity"] == rarity)]
-    filtered.sort(key=lambda c: (-c["power"], -c["level"], c["name"]))
-    total_pages = max(1, (len(filtered) + 11) // 12)
+    filtered.sort(key=lambda c: (-data.RARITY_INDEX[c["rarity"]], -c["power"], -c["level"], c["name"]))
+    total_pages = max(1, (len(filtered) + 9) // 10)
     page = min(page, total_pages)
-    page_items = filtered[(page - 1) * 12: page * 12]
+    page_items = filtered[(page - 1) * 10: page * 10]
+    rarity_counts: dict[str, int] = {}
+    for character in filtered:
+        rarity_counts[character["rarity"]] = rarity_counts.get(character["rarity"], 0) + 1
     lines = [
         f"🎴 <b>YOUR HEROES</b> — {len(owned)} owned",
-        f"Filter: {series_name(series) if series else 'All series'} • {data.RARITIES[rarity]['name'] if rarity else 'All rarities'}",
+        f"📺 {series_name(series) if series else 'All series'} • "
+        f"🏅 {data.RARITIES[rarity]['name'] if rarity else 'All rarity ranks'} • "
+        f"Showing <b>{len(filtered)}</b>",
         "",
     ]
     if not page_items:
         lines.append("No heroes match this filter. Summon more with /gacha.")
+    last_rarity = None
     for character in page_items:
         rarity_info = data.RARITIES[character["rarity"]]
         element_info = data.ELEMENTS[character["element"]]
+        if character["rarity"] != last_rarity:
+            if last_rarity is not None:
+                lines.append("")
+            lines.append(f"{rarity_info['emoji']} <b>{rarity_info['name'].upper()}</b> — {rarity_counts.get(character['rarity'], 0)} heroes")
+            last_rarity = character["rarity"]
         power = game.power_score(game.scaled_character(character))
         lines.append(
             f"{rarity_info['emoji']} {element_info['emoji']} <b>{ui.esc(character['name'])}</b> "
@@ -482,20 +516,41 @@ async def characters_view(update: Update, context: ContextTypes.DEFAULT_TYPE, ar
             f"   🆔 <code>{character['id']}</code>"
         )
     lines.extend(["", f"Page {page}/{total_pages} • Use /character &lt;id&gt; for details."])
-    buttons = []
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    series_buttons = [InlineKeyboardButton("🌐 All Series", callback_data=f"chars:all:{rarity or 'all'}:1")]
+    series_buttons.extend(
+        InlineKeyboardButton(
+            f"{data.SERIES[s]['emoji']} {data.SERIES[s]['short']}",
+            callback_data=f"chars:{s}:{rarity or 'all'}:1",
+        )
+        for s in data.SERIES_ORDER
+    )
+    for index in range(0, len(series_buttons), 3):
+        keyboard_rows.append(series_buttons[index:index + 3])
+    rarity_buttons = [InlineKeyboardButton("🏅 All Ranks", callback_data=f"chars:{series or 'all'}:all:1")]
+    rarity_buttons.extend(
+        InlineKeyboardButton(
+            f"{data.RARITIES[r]['emoji']} {data.RARITIES[r]['name']}",
+            callback_data=f"chars:{series or 'all'}:{r}:1",
+        )
+        for r in reversed(data.RARITY_ORDER)
+    )
+    for index in range(0, len(rarity_buttons), 4):
+        keyboard_rows.append(rarity_buttons[index:index + 4])
+    for character in page_items:
+        keyboard_rows.append([InlineKeyboardButton(
+            f"{data.RARITIES[character['rarity']]['emoji']} {character['name']} • Lv.{character['level']}",
+            callback_data=f"char:view:{character['id']}",
+        )])
+    nav = []
     if page > 1:
-        buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"chars:{series or 'all'}:{rarity or 'all'}:{page - 1}"))
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"chars:{series or 'all'}:{rarity or 'all'}:{page - 1}"))
     if page < total_pages:
-        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"chars:{series or 'all'}:{rarity or 'all'}:{page + 1}"))
-    keyboard_rows = []
-    for index in range(0, len(page_items), 2):
-        row = []
-        for character in page_items[index:index + 2]:
-            row.append(InlineKeyboardButton(f"🎴 {character['name']}", callback_data=f"char:view:{character['id']}"))
-        keyboard_rows.append(row)
-    if buttons:
-        keyboard_rows.append(buttons)
-    keyboard_rows.append([InlineKeyboardButton("👥 Team", callback_data="team:view"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"chars:{series or 'all'}:{rarity or 'all'}:{page + 1}"))
+    if nav:
+        keyboard_rows.append(nav)
+    keyboard_rows.append([InlineKeyboardButton("👥 Team", callback_data="team:view"), InlineKeyboardButton("👑 Crown", callback_data="crown:view")])
+    keyboard_rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(keyboard_rows))
 
 
@@ -547,7 +602,12 @@ async def cmd_character(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await character_detail(update, context, " ".join(context.args))
 
 
-async def team_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def team_view(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    series: str | None = None,
+    rarity: str | None = None,
+) -> None:
     player = await guard(update, context)
     if player is None:
         return
@@ -574,7 +634,10 @@ async def team_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append(f"⚔️ <b>Combined Power:</b> {ui.fmt(combined_power)}")
     lines.append("Use ⬆️ and ⬇️ to swap slots. Slot 1 is your main hero.")
     lines.append("")
-    lines.append("📋 <b>Your Heroes</b> — tap to add/remove")
+    lines.append(
+        f"📋 <b>Your Heroes</b> — {series_name(series) if series else 'All series'} • "
+        f"{data.RARITIES[rarity]['name'] if rarity else 'All ranks'}"
+    )
     rows = []
     for index, cid in enumerate(team, 1):
         name = by_id[cid]["name"]
@@ -590,7 +653,33 @@ async def team_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 InlineKeyboardButton("⬇️", callback_data=f"team:down:{cid}"),
                 InlineKeyboardButton("➖", callback_data=f"team:remove:{cid}"),
             ])
-    available = [c for c in sorted(characters, key=lambda c: (-c["power"], -c["level"])) if c["id"] not in team]
+    available = [
+        c for c in characters
+        if c["id"] not in team
+        and (not series or c["series"] == series)
+        and (not rarity or c["rarity"] == rarity)
+    ]
+    available.sort(key=lambda c: (-data.RARITY_INDEX[c["rarity"]], -c["power"], -c["level"], c["name"]))
+    series_buttons = [InlineKeyboardButton("🌐 All Series", callback_data=f"team:filter:all:{rarity or 'all'}")]
+    series_buttons.extend(
+        InlineKeyboardButton(
+            f"{data.SERIES[s]['emoji']} {data.SERIES[s]['short']}",
+            callback_data=f"team:filter:{s}:{rarity or 'all'}",
+        )
+        for s in data.SERIES_ORDER
+    )
+    for index in range(0, len(series_buttons), 3):
+        rows.append(series_buttons[index:index + 3])
+    rarity_buttons = [InlineKeyboardButton("🏅 All Ranks", callback_data=f"team:filter:{series or 'all'}:all")]
+    rarity_buttons.extend(
+        InlineKeyboardButton(
+            f"{data.RARITIES[r]['emoji']} {data.RARITIES[r]['name']}",
+            callback_data=f"team:filter:{series or 'all'}:{r}",
+        )
+        for r in reversed(data.RARITY_ORDER)
+    )
+    for index in range(0, len(rarity_buttons), 4):
+        rows.append(rarity_buttons[index:index + 4])
     add_buttons = [
         InlineKeyboardButton(
             f"➕ {c['name']} Lv.{c['level']}",
@@ -601,7 +690,7 @@ async def team_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for index in range(0, len(add_buttons), 2):
         rows.append(add_buttons[index:index + 2])
     if not available:
-        lines.append("<i>All owned heroes are already in the team.</i>")
+        lines.append("<i>No available heroes match this filter.</i>")
     rows.append([InlineKeyboardButton("🧹 Clear Team", callback_data="team:clear"), InlineKeyboardButton("🎴 Heroes", callback_data="chars:all:all:1")])
     rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
@@ -623,23 +712,94 @@ async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await respond(update, f"✅ Team updated: {names}", ui.main_menu_keyboard())
 
 
-async def hero_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, title: str) -> None:
+PICK_TITLES = {
+    "setmain": "⚔️ Choose your main hero",
+    "level": "⬆️ Choose a hero to level up",
+    "awaken": "⭐ Choose a hero to awaken",
+}
+
+
+async def hero_picker(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    title: str,
+    series: str | None = None,
+    rarity: str | None = None,
+    page: int = 1,
+) -> None:
     player = await guard(update, context)
     if player is None:
         return
     db = get_db(context)
-    characters = sorted(db.characters(update.effective_user.id), key=lambda c: (-c["power"], -c["level"]))
+    characters = db.characters(update.effective_user.id)
     if not characters:
         await respond(update, "You have no heroes yet. Summon with /gacha.")
         return
-    rows = []
-    for character in characters[:24]:
+    filtered = [c for c in characters if (not series or c["series"] == series) and (not rarity or c["rarity"] == rarity)]
+    filtered.sort(key=lambda c: (-data.RARITY_INDEX[c["rarity"]], -c["power"], -c["level"], c["name"]))
+    total_pages = max(1, (len(filtered) + 19) // 20)
+    page = min(max(1, page), total_pages)
+    page_items = filtered[(page - 1) * 20:page * 20]
+    lines = [
+        title,
+        f"📺 {series_name(series) if series else 'All series'} • "
+        f"🏅 {data.RARITIES[rarity]['name'] if rarity else 'All rarity ranks'} • "
+        f"Showing <b>{len(filtered)}</b> • Page {page}/{total_pages}",
+        "",
+    ]
+    if not page_items:
+        lines.append("No heroes match this filter.")
+    else:
+        last_rarity = None
+        for character in page_items:
+            if character["rarity"] != last_rarity:
+                if last_rarity is not None:
+                    lines.append("")
+                info = data.RARITIES[character["rarity"]]
+                lines.append(f"{info['emoji']} <b>{info['name'].upper()}</b>")
+                last_rarity = character["rarity"]
+            lines.append(
+                f"• {data.RARITIES[character['rarity']]['emoji']} <b>{ui.esc(character['name'])}</b> "
+                f"Lv.{character['level']} ⭐{character['stars']}"
+            )
+    lines.append("")
+    lines.append("Tap a hero below. Use the filters to browse by series and rarity rank.")
+    rows: list[list[InlineKeyboardButton]] = []
+    for character in page_items:
         rows.append([InlineKeyboardButton(
             f"{data.RARITIES[character['rarity']]['emoji']} {character['name']} Lv.{character['level']}",
             callback_data=f"char:{action}:{character['id']}",
         )])
+    series_buttons = [InlineKeyboardButton("🌐 All Series", callback_data=f"pick:{action}:all:{rarity or 'all'}:1")]
+    series_buttons.extend(
+        InlineKeyboardButton(
+            f"{data.SERIES[s]['emoji']} {data.SERIES[s]['short']}",
+            callback_data=f"pick:{action}:{s}:{rarity or 'all'}:1",
+        )
+        for s in data.SERIES_ORDER
+    )
+    for index in range(0, len(series_buttons), 3):
+        rows.append(series_buttons[index:index + 3])
+    rarity_buttons = [InlineKeyboardButton("🏅 All Ranks", callback_data=f"pick:{action}:{series or 'all'}:all:1")]
+    rarity_buttons.extend(
+        InlineKeyboardButton(
+            f"{data.RARITIES[r]['emoji']} {data.RARITIES[r]['name']}",
+            callback_data=f"pick:{action}:{series or 'all'}:{r}:1",
+        )
+        for r in reversed(data.RARITY_ORDER)
+    )
+    for index in range(0, len(rarity_buttons), 4):
+        rows.append(rarity_buttons[index:index + 4])
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pick:{action}:{series or 'all'}:{rarity or 'all'}:{page - 1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"pick:{action}:{series or 'all'}:{rarity or 'all'}:{page + 1}"))
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("🎴 All Heroes", callback_data="chars:all:all:1"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
-    await respond(update, f"{title}\n\nTap a hero below. No typing needed.", InlineKeyboardMarkup(rows))
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def cmd_equipchar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2793,16 +2953,6 @@ async def cmd_crown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
     elif not clan:
         lines.append("<i>No open clans match your level. Create one below.</i>")
-    is_admin = config.is_admin(update.effective_user.id)
-    if is_admin:
-        lines.extend([
-            "",
-            "🖼️ <b>Custom Art</b>",
-        ])
-        total_uploads = sum(len(db.art_keys(entity_type)) for entity_type in ART_TYPES)
-        lines.append(f"Uploaded custom images: <b>{total_uploads}</b> • Reply to a photo with <code>/upload NAME</code>")
-    else:
-        lines.extend(["", "<i>Custom art tools are available to admins only.</i>"])
     rows = []
     avatar_buttons = [
         InlineKeyboardButton(
@@ -2818,10 +2968,7 @@ async def cmd_crown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🏯 Join {item['name']} [{item['tag']}]",
             callback_data=f"crown:clan:{item['tag']}",
         )])
-    if is_admin:
-        rows.append([InlineKeyboardButton("🏯 Clan Menu", callback_data="menu:clan"), InlineKeyboardButton("🖼️ Manage Art", callback_data="crown:art")])
-    else:
-        rows.append([InlineKeyboardButton("🏯 Clan Menu", callback_data="menu:clan"), InlineKeyboardButton("🎴 Heroes", callback_data="chars:all:all:1")])
+    rows.append([InlineKeyboardButton("🏯 Clan Menu", callback_data="menu:clan"), InlineKeyboardButton("🎴 Heroes", callback_data="chars:all:all:1")])
     rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
@@ -2840,7 +2987,7 @@ async def crown_art_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "world": "🌍 World Bosses", "clanraid": "🏯 Clan Raids", "pet": "🐾 Pets", "map": "🗺️ Maps",
         "chapter": "📖 Chapters", "clan": "🏯 Clans", "profile": "👤 Profiles",
     }
-    lines = ["👑 <b>CROWN — DYNAMIC ART MANAGER</b>", "Add custom art to any entity.", ""]
+    lines = ["👑 <b>CROWN ART — DYNAMIC ART MANAGER</b>", "Add or replace custom art for any entity.", ""]
     for entity_type, entries in catalog.items():
         uploaded = len(db.art_keys(entity_type))
         if entries:
@@ -2858,8 +3005,12 @@ async def crown_art_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     rows = []
     for index in range(0, len(art_buttons), 2):
         rows.append(art_buttons[index:index + 2])
-    rows.append([InlineKeyboardButton("⬅️ Crown", callback_data="crown:view"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    rows.append([InlineKeyboardButton("⬅️ Crown Art", callback_data="crownart:view"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def cmd_crownart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await crown_art_view(update, context)
 
 
 async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2891,7 +3042,7 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     query = " ".join(args).strip()
     target = _resolve_art_target(query, forced_type, db)
     if target is None:
-        await respond(update, f"❌ No art target matches <b>{ui.esc(query)}</b>. Try /crown for valid types or use <code>/upload boss NAME</code>.")
+        await respond(update, f"❌ No art target matches <b>{ui.esc(query)}</b>. Use /crownart for valid categories or <code>/upload boss NAME</code>.")
         return
     entity_type, entity_key, name = target
     db.art_set(entity_type, entity_key, name, file_id, update.effective_user.id)
@@ -3043,7 +3194,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("weekly", "Claim weekly reward"),
     ("monthly", "Claim monthly reward"),
     ("travel", "Change home series"),
-    ("crown", "Profile avatar, clan hall, and art"),
+    ("crown", "Profile avatar and clan hall"),
     ("chapters", "View story chapters"),
     ("chapter", "Fight a story chapter"),
     ("inv", "Open inventory"),
@@ -3183,6 +3334,8 @@ HANDLERS = {
     "element": cmd_element,
     "unstuck": cmd_unstuck,
     "crown": cmd_crown,
+    "crownart": cmd_crownart,
+    "crown_art": cmd_crownart,
     "upload": cmd_upload,
     "top": cmd_top,
     "inv": cmd_inv,
@@ -3380,6 +3533,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         args.append(page)
         await characters_view(update, context, args)
         return
+    if key == "pick" and len(parts) > 3:
+        action = parts[1]
+        series = parts[2] if parts[2] != "all" else None
+        rarity = parts[3] if parts[3] != "all" else None
+        page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 1
+        if action not in PICK_TITLES:
+            await respond(update, "❌ Unknown hero action.", ui.back_keyboard())
+            return
+        await hero_picker(update, context, action, PICK_TITLES[action], series=series, rarity=rarity, page=page)
+        return
     if key == "char":
         action = parts[1] if len(parts) > 1 else ""
         char_id = parts[2] if len(parts) > 2 else ""
@@ -3407,6 +3570,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if action == "clear":
             db.set_team(update.effective_user.id, [])
             await team_view(update, context)
+            return
+        if action == "filter" and len(parts) > 3:
+            series = parts[2] if parts[2] != "all" else None
+            rarity = parts[3] if parts[3] != "all" else None
+            await team_view(update, context, series=series, rarity=rarity)
             return
         if action in ("up", "down") and len(parts) > 2:
             char_id = parts[2]
@@ -3544,6 +3712,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await cmd_profile(update, context)
         return
+    if key == "crownart":
+        await crown_art_view(update, context)
+        return
     if key == "crown":
         player = await guard(update, context)
         if player is None:
@@ -3591,7 +3762,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         db = get_db(context)
         entity_type = parts[2]
         if entity_type not in ART_TYPES:
-            await respond(update, "❌ Unknown art category.", ui.back_keyboard("crown:art"))
+            await respond(update, "❌ Unknown art category.", ui.back_keyboard("crownart:view"))
             return
         labels = {
             "character": "Heroes", "npc": "NPCs", "boss": "Bosses", "summon": "Summons",
@@ -3609,7 +3780,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         have_count = sum(1 for key, _ in entries if key in uploaded)
         lines = [
             f"👑 <b>CROWN · {labels.get(entity_type, entity_type.title()).upper()}</b>",
-            f"✅ Uploaded: <b>{have_count}</b> • 📦 Slots: <b>{len(entries)}</b> • Page {page}/{total_pages}",
+            f"✅ Uploaded: <b>{have_count}</b> • ❌ Missing: <b>{len(entries) - have_count}</b> • 📦 Slots: <b>{len(entries)}</b> • Page {page}/{total_pages}",
             "",
         ]
         if page_entries:
@@ -3628,7 +3799,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if page < total_pages:
             nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"art:list:{entity_type}:{page + 1}"))
         rows = [nav] if nav else []
-        rows.append([InlineKeyboardButton("🖼️ Crown Art", callback_data="crown:art"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+        rows.append([InlineKeyboardButton("🖼️ Crown Art", callback_data="crownart:view"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
         await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
         return
     if key == "boss":
