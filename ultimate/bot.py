@@ -428,7 +428,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/achievements • /claimach • /titles • /title &lt;title_id&gt;\n\n"
         "<b>🌍 World & Profile</b>\n"
         "/profile • /stats • /daily • /weekly • /monthly\n"
-        "/leaderboard [wealth|players|arena|clans|raid] — wealth/collection is page 1\n"
+        "/leaderboard [wealth|players|arena|clans|raid] — wealth/collection is page 1\n/wealth — shortcuts to wealth leaderboard • /collection — per-series collection progress\n"
         "/travel &lt;series&gt; or /switch &lt;series&gt; • /series • /codex • /events\n"
         "/chapters [series] • /chapter [series] [number] — story battles\n"
         "/explore — tap-through battle map • /heal — heal from a menu\n"
@@ -441,7 +441,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text += (
             "<b>🛠 Admin</b>\n"
             "/admin or /admin_help • /grant • /ban • /unban • /broadcast • /backup\n"
-            "/crownart — hidden custom art manager • /upload TYPE NAME\n/createcode CODE rewards [uses=] [days=] — create redeem code\n"
+            "/crownart — hidden custom art manager • /upload TYPE NAME\n/createcode CODE rewards [uses=] [days=] — create redeem code\n/codes — list redeem codes\n"
             "/setlevel &lt;user&gt; &lt;level&gt; • /admin_heal &lt;user&gt; • /resetplayer &lt;user&gt;\n\n"
         )
     text += "<i>Most actions are also available as inline buttons.</i>"
@@ -2554,6 +2554,43 @@ async def cmd_petsummon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await pet_summon_result(update, context, count)
 
 
+async def cmd_wealth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await leaderboard_view(update, context, "wealth")
+
+
+async def cmd_collection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    owned = game.series_collection(db, update.effective_user.id)
+    total_owned = sum(owned.values())
+    total_all = len(data.CHARACTERS)
+    lines = ["🎴 <b>COLLECTION PROGRESS</b>", f"Overall: <b>{total_owned}/{total_all}</b> heroes ({total_owned * 100 / total_all:.1f}%)", ""]
+    for series in data.SERIES_ORDER:
+        info = data.SERIES[series]
+        have = owned.get(series, 0)
+        total = len(data.CHARACTERS_BY_SERIES[series])
+        bar = ui.percent_bar(have, total, 10)
+        lines.append(f"{info['emoji']} <b>{ui.esc(info['name'])}</b> — {have}/{total}\n{bar}")
+    await respond(update, "\n".join(lines), ui.back_keyboard())
+
+
+async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard_admin(update, context)
+    if player is None:
+        return
+    rows = get_db(context).redeem_codes_list(20)
+    lines = ["🎟️ <b>REDEEM CODES</b>", ""]
+    if not rows:
+        lines.append("No codes created yet. Use /createcode.")
+    for row in rows:
+        reward_text = ", ".join(f"{reward.get('kind')}:{reward.get('id', reward.get('qty', ''))}" for reward in row.get("rewards", []))
+        expiry = f" • expires {row['expires_at']}" if row.get("expires_at") else ""
+        lines.append(f"• <code>{ui.esc(row['code'])}</code> — {row['used_count']}/{row['max_uses']} used{expiry}\n   {ui.esc(reward_text)}")
+    await respond(update, "\n".join(lines), ui.back_keyboard("admin:menu"))
+
+
 async def cmd_dungeon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     series = parse_series(context.args[0]) if context.args else None
     await start_battle(update, context, "dungeon", series=series)
@@ -3642,6 +3679,9 @@ HANDLERS = {
     "arena": cmd_arena,
     "duel": cmd_duel,
     "leaderboard": cmd_leaderboard,
+    "wealth": cmd_wealth,
+    "collection": cmd_collection,
+    "codes": cmd_codes,
     "clan": cmd_clan,
     "clan_create": cmd_clan_create,
     "clan_join": cmd_clan_join,

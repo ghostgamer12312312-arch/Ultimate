@@ -599,6 +599,19 @@ class Database:
                 item["rewards"] = []
         return item
 
+    def redeem_codes_list(self, limit: int = 20) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM redeem_codes ORDER BY created_at DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        result = _rows_to_dicts(rows)
+        for item in result:
+            try:
+                item["rewards"] = json.loads(item.get("rewards") or "[]")
+            except json.JSONDecodeError:
+                item["rewards"] = []
+        return result
+
     def redeem_code_claim(self, user_id: int, code: str) -> dict:
         code = (code or "").strip().upper()
         if not code:
