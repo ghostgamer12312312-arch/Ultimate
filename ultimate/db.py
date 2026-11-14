@@ -396,15 +396,28 @@ class Database:
     def __init__(self, path: str | Path | None = None, *, auto_init: bool = True):
         self.path = str(path or config.DB_PATH)
         self._lock = threading.RLock()
+        self._local = threading.local()
         if auto_init:
             self.init()
 
+    def _pool(self) -> list[sqlite3.Connection]:
+        pool = getattr(self._local, "pool", None)
+        if pool is None:
+            pool = []
+            self._local.pool = pool
+        return pool
+
     @contextmanager
     def conn(self):
-        connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=30000")
+        pool = self._pool()
+        connection = pool.pop() if pool else None
+        if connection is None:
+            connection = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=10000")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA cache_size=-8000")
         try:
             yield connection
             connection.commit()
@@ -412,7 +425,19 @@ class Database:
             connection.rollback()
             raise
         finally:
-            connection.close()
+            if len(pool) < 8:
+                pool.append(connection)
+            else:
+                connection.close()
+
+    def close(self) -> None:
+        pool = getattr(self._local, "pool", None) or []
+        for connection in pool:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+        self._local.pool = []
 
     def init(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)

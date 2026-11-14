@@ -3532,6 +3532,7 @@ async def post_shutdown(application: Application) -> None:
     db = application.bot_data.get("db")
     if db is not None:
         db.ping()
+        db.close()
     logger.info("Shutdown complete.")
 
 
