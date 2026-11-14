@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import random
 import shutil
@@ -3779,11 +3780,40 @@ HANDLERS = {
 }
 
 
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _answer_callback(query) -> None:
+    try:
+        await query.answer()
+    except (BadRequest, TelegramError) as exc:
+        logger.debug("Callback answer failed: %s", exc)
+
+
+def timed_handler(label: str, handler):
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        started = time.perf_counter()
+        try:
+            return await handler(update, context)
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if elapsed_ms > 700:
+                logger.warning("Slow handler %s: %.0f ms", label, elapsed_ms)
+    return wrapper
+
+
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
         return
-    await query.answer()
+    _spawn(_answer_callback(query))
     payload = query.data or ""
     parts = payload.split(":")
     key = parts[0]
@@ -4398,8 +4428,8 @@ def build_application() -> Application:
         .build()
     )
     for name, handler in HANDLERS.items():
-        application.add_handler(CommandHandler(name, handler))
-    application.add_handler(CallbackQueryHandler(callback_router))
+        application.add_handler(CommandHandler(name, timed_handler(name, handler)))
+    application.add_handler(CallbackQueryHandler(timed_handler("callback", callback_router)))
     application.add_error_handler(error_handler)
     return application
 
