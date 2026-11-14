@@ -325,7 +325,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/daily_shop • /dailybuy &lt;slot&gt;\n/forge [recipe_id] • /craft [recipe_id] • /enhance &lt;slot|instance_id&gt;\n"
         "/market [page] • /market_sell &lt;item_id&gt; &lt;qty&gt; &lt;price&gt;\n/market_buy &lt;listing_id&gt; • /market_cancel &lt;listing_id&gt;\n"
         "/give &lt;user&gt; &lt;kind&gt; &lt;id|amount&gt; [qty] — send assets (or reply)\n"
-        "/trade &lt;user&gt; — start a trade • /trade add/remove/view/confirm/cancel\n\n"
+        "/trade &lt;user|reply&gt; — pet trading with buttons • /trade add/remove/view/confirm/cancel\n\n"
         "<b>🏯 Clans & Quests</b>\n"
         "/clan • /clan_create &lt;name&gt; &lt;tag&gt; • /clan_join &lt;name|tag&gt; • /clan_leave\n"
         "/clan_info • /clan_donate &lt;yens|gems|crystals&gt; &lt;amount&gt;\n"
@@ -2621,8 +2621,7 @@ async def cmd_give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     label = result.get("label", "asset")
     target_name = display_name(target, str(target["user_id"]))
     giver_name = display_name(player, str(player["user_id"]))
-    await respond(update, f"✅ <b>Gift sent!</b>\n🎁 {ui.esc(label)} → <b>{ui.esc(target_name)}</b>\nThey have been notified in DM.")
-    await notify_user(
+    notified = await notify_user(
         context,
         int(target["user_id"]),
         "🎁 <b>YOU RECEIVED A GIFT!</b>\n\n"
@@ -2632,6 +2631,8 @@ async def cmd_give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Check /inventory to see your new items.",
         ui.main_menu_keyboard(),
     )
+    note = "They have been notified in DM." if notified else "They must start the bot once to receive DM notifications."
+    await respond(update, f"✅ <b>Gift sent!</b>\n🎁 {ui.esc(label)} → <b>{ui.esc(target_name)}</b>\n{note}")
 
 
 async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2714,8 +2715,7 @@ async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await respond(update, f"❌ {ui.esc(result.get('reason', 'Grant failed.'))}")
         return
     message = result.get("message", "Grant complete.")
-    await respond(update, f"✅ {ui.esc(message)}")
-    await notify_user(
+    notified = await notify_user(
         context,
         int(target["user_id"]),
         "🎁 <b>ADMIN GRANT RECEIVED</b>\n\n"
@@ -2724,6 +2724,8 @@ async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Use /inventory or /profile to view your account.",
         ui.main_menu_keyboard(),
     )
+    note = "Recipient notified in DM." if notified else "Recipient must start the bot once to receive DM notifications."
+    await respond(update, f"✅ {ui.esc(message)}\n{note}")
 
 
 def _offer_label(db: Database, trade: dict, side: str, offer: dict) -> str:
