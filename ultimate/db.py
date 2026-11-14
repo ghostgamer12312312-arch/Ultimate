@@ -515,10 +515,12 @@ class Database:
                 "UPDATE players SET username=?, first_name=?, last_seen=? WHERE user_id=?",
                 (username or "", first_name or "", now, int(user_id)),
             )
+            row = c.execute("SELECT starter_claimed FROM players WHERE user_id=?", (int(user_id),)).fetchone()
+            starter_claimed = int(row["starter_claimed"] or 0) if row else 0
             created = c.execute("SELECT COUNT(*) AS n FROM characters WHERE user_id=?", (int(user_id),)).fetchone()["n"] == 0
-        if created:
+        if created and not starter_claimed:
             self.grant_starter_pack(user_id, series)
-        if not self.pets(user_id):
+        if created:
             self.add_pet(user_id, data.STARTER_PET)
         self.refresh_stamina(user_id)
         return self.player(user_id) or {}
@@ -718,7 +720,6 @@ class Database:
             elapsed = max(0, now - int(row["stamina_updated"] or now))
             regen = elapsed // config.STAMINA_REGEN_SECONDS
             if regen <= 0:
-                c.execute("UPDATE players SET stamina_updated=? WHERE user_id=?", (now, int(user_id)))
                 return
             stamina = min(int(row["max_stamina"]), int(row["stamina"]) + int(regen))
             c.execute(
@@ -2236,12 +2237,18 @@ class Database:
         side = self._trade_side(trade, user_id)
         if side is None:
             return {"ok": False, "reason": "You are not part of that trade."}
+        offers = self._trade_offers(trade)
+        if not offers[side]:
+            return {"ok": False, "reason": "Offer at least one item before confirming."}
         with self.conn() as c:
             c.execute(f"UPDATE trades SET {side}_ok=1, updated_at=? WHERE id=?", (_now(), int(trade["id"])))
             row = c.execute("SELECT * FROM trades WHERE id=?", (int(trade["id"]),)).fetchone()
             if not (row["initiator_ok"] and row["target_ok"]):
                 return {"ok": True, "waiting": True, "trade": _row_to_dict(row)}
             offers = self._trade_offers(dict(row))
+            if not offers["initiator"] or not offers["target"]:
+                c.execute("UPDATE trades SET initiator_ok=0, target_ok=0, updated_at=? WHERE id=?", (_now(), int(row["id"])))
+                return {"ok": False, "reason": "Both players must offer at least one item before the trade can complete."}
             c.execute("SAVEPOINT trade_execute")
             try:
                 for offer in offers["initiator"]:

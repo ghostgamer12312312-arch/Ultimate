@@ -50,3 +50,6 @@ __pycache__/
 node_modules/
 *.db
 *.sqlite
+
+# Generated card images
+ultimate/generated/

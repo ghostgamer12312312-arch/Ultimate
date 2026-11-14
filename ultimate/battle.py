@@ -578,7 +578,8 @@ def _finish(db, user_id: int, battle: dict, outcome: str) -> dict:
             ])
             drops[bonus_item] = int(drops.get(bonus_item, 0)) + 1
     _grant(db, user_id, rewards, drops)
-    _record(db, user_id, battle, won)
+    if outcome != "fled":
+        _record(db, user_id, battle, won)
     state["status"] = "finished"
     state["outcome"] = outcome
     state["rewards"] = rewards
@@ -633,12 +634,8 @@ def act(db, user_id: int, battle_id: str, action: str, payload: str | None = Non
     rng = _rng()
     action = (action or "attack").lower()
     if action == "flee":
-        chance = min(0.90, 0.20 + float(player["spd"]) / max(1.0, float(player["spd"]) + float(enemy["spd"])) * 0.70)
-        if rng.random() < chance:
-            state["log"].append("🏃 You escaped the battle.")
-            return {"ok": True, "battle": _finish(db, user_id, battle, "fled"), "finished": True}
-        state["log"].append("❌ Escape failed!")
-        _enemy_attack(db, user_id, battle, rng)
+        state["log"].append("🏃 You escaped the battle.")
+        return {"ok": True, "battle": _finish(db, user_id, battle, "fled"), "finished": True}
     elif action == "potion":
         item = data.ITEMS.get(payload or "")
         if item is None or item.get("kind") != "heal":

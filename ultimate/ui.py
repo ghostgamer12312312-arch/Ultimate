@@ -119,9 +119,10 @@ def shop_keyboard():
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧪 Potions", callback_data="shop:potions"), InlineKeyboardButton("🎟️ Summon", callback_data="shop:summon")],
-        [InlineKeyboardButton("🧰 Materials", callback_data="shop:materials"), InlineKeyboardButton("⚙️ Gear", callback_data="shop:gear")],
-        [InlineKeyboardButton("🌅 Daily Shop", callback_data="shop:daily"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+        [InlineKeyboardButton("🗂️ All Items", callback_data="shop:all"), InlineKeyboardButton("🧪 Potions", callback_data="shop:potions")],
+        [InlineKeyboardButton("🎟️ Summon", callback_data="shop:summon"), InlineKeyboardButton("🧰 Materials", callback_data="shop:materials")],
+        [InlineKeyboardButton("⚙️ Gear", callback_data="shop:gear"), InlineKeyboardButton("🌅 Daily Shop", callback_data="shop:daily")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ])
 
 

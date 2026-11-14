@@ -17,14 +17,13 @@ from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 try:
-    from . import battle, config, data, game, images, ui
+    from . import battle, config, data, game, ui
     from .db import Database
 except ImportError:
     import battle
     import config
     import data
     import game
-    import images
     import ui
     from db import Database
 
@@ -87,19 +86,6 @@ async def respond(update: Update, text: str, keyboard=None) -> None:
         logger.warning("Could not send response: %s", exc)
 
 
-async def send_card(update: Update, path: str, caption: str = "") -> bool:
-    message = update.effective_message
-    if message is None:
-        return False
-    try:
-        with open(path, "rb") as photo:
-            await message.reply_photo(photo=photo, caption=caption[:1024], parse_mode=ParseMode.HTML)
-        return True
-    except (BadRequest, TelegramError, OSError) as exc:
-        logger.warning("Could not send image: %s", exc)
-        return False
-
-
 async def show_battle(update: Update, context: ContextTypes.DEFAULT_TYPE, battle_data: dict) -> None:
     db = get_db(context)
     user_id = update.effective_user.id
@@ -118,89 +104,6 @@ async def start_battle(update: Update, context: ContextTypes.DEFAULT_TYPE, mode:
     if result.get("resumed"):
         await respond(update, "⚔️ Resuming your active battle.")
     await show_battle(update, context, result["battle"])
-    if not result.get("resumed"):
-        enemy = result["battle"]["state"].get("enemy", {})
-        caption = f"⚔️ {ui.esc(enemy.get('name', 'Enemy'))} — Lv.{enemy.get('level', 1)}"
-        await send_entity_art(update, db, enemy.get("art"), enemy.get("art_key"), caption)
-
-
-async def send_file_id(update: Update, file_id: str, caption: str = "") -> bool:
-    message = update.effective_message
-    if message is None:
-        return False
-    try:
-        await message.reply_photo(photo=file_id, caption=caption[:1024], parse_mode=ParseMode.HTML)
-        return True
-    except (BadRequest, TelegramError) as exc:
-        logger.warning("Could not send custom art: %s", exc)
-        return False
-
-
-def _find_art_entity(db: Database, art_type: str, key: str) -> dict | None:
-    if art_type == "character":
-        return data.CHARACTERS.get(key)
-    if art_type == "npc":
-        return next((npc for npcs in data.NPCS.values() for npc in npcs if npc["id"] == key), None)
-    if art_type == "boss":
-        return next((boss for bosses in data.BOSSES.values() for boss in bosses if boss["id"] == key), None)
-    if art_type == "summon":
-        return data.SUMMON_BOSS_BY_ID.get(key)
-    if art_type == "world":
-        return data.WORLD_BOSS_BY_ID.get(key)
-    if art_type == "clanraid":
-        return data.CLAN_RAID_BY_ID.get(key)
-    if art_type == "chapter":
-        return data.CHAPTER_BY_ID.get(key)
-    if art_type == "pet":
-        return data.PETS.get(key)
-    if art_type == "map":
-        return next((floor for floors in data.DUNGEONS.values() for floor in floors if floor["id"] == key), None)
-    return None
-
-
-def _fallback_card(db: Database, art_type: str, key: str, caption: str) -> str | None:
-    entity = _find_art_entity(db, art_type, key)
-    if entity is None:
-        return None
-    if art_type == "character":
-        return images.character_card(entity)
-    if art_type == "npc":
-        return images.enemy_card(entity)
-    if art_type in ("boss", "summon", "world", "clanraid"):
-        return images.boss_card(entity, kind=art_type)
-    if art_type == "chapter":
-        return images.chapter_card(entity)
-    if art_type == "pet":
-        bonus = ", ".join(f"{name.replace('_pct', '').upper()} +{int(value * 100)}%" for name, value in entity.get("bonus", {}).items())
-        return images.generic_card("pet", key, entity["name"], f"{entity.get('rarity', 'common').title()} companion", [entity.get("desc", ""), bonus], series=entity.get("series", "universal"), badge="COMPANION", extra=str(entity.get("level", 1)))
-    if art_type == "map":
-        return images.generic_card("map", key, entity["name"], "Dungeon floor", [f"Level {entity.get('level', 1)}", f"HP {entity.get('hp', 0):,}"], series=entity.get("series", "universal"), badge="DUNGEON")
-    return None
-
-
-async def send_entity_art(
-    update: Update,
-    db: Database,
-    art_type: str | None,
-    art_key: str | None,
-    caption: str = "",
-    *,
-    extra_keys: tuple[str, ...] = (),
-    fallback: bool = True,
-    fallback_type: str | None = None,
-    fallback_key: str | None = None,
-) -> bool:
-    if art_type and art_key:
-        for key in (str(art_key), *extra_keys):
-            art = db.art_get(art_type, key)
-            if art and art.get("file_id") and await send_file_id(update, art["file_id"], caption):
-                return True
-    if not fallback:
-        return False
-    path = _fallback_card(db, fallback_type or art_type or "", fallback_key or art_key or "", caption)
-    if path:
-        return await send_card(update, path, caption)
-    return False
 
 
 def replied_user(update: Update):
@@ -310,6 +213,36 @@ def series_name(series: str) -> str:
     return f"{info['emoji']} {info['name']}" if info else series
 
 
+def display_name(player: dict | None, fallback: str = "Summoner") -> str:
+    if not player:
+        return fallback
+    return player.get("first_name") or player.get("username") or str(player.get("user_id", fallback))
+
+
+def trade_keyboard(trade: dict) -> InlineKeyboardMarkup:
+    trade_id = int(trade["id"])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🐾 Offer a Pet", callback_data=f"trade:petmenu:{trade_id}")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data=f"trade:view:{trade_id}"), InlineKeyboardButton("✅ Confirm", callback_data=f"trade:confirm:{trade_id}")],
+        [InlineKeyboardButton("❌ Cancel Trade", callback_data=f"trade:cancel:{trade_id}")],
+    ])
+
+
+async def notify_user(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, keyboard=None) -> bool:
+    try:
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return True
+    except (BadRequest, TelegramError) as exc:
+        logger.info("Could not notify user %s: %s", user_id, exc)
+        return False
+
+
 def main_menu_text(player: dict) -> str:
     return (
         f"🐉 <b>{ui.esc(config.GAME_NAME)}</b>\n"
@@ -324,32 +257,10 @@ def main_menu_text(player: dict) -> str:
     )
 
 
-async def send_telegram_avatar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    message = update.effective_message
-    if user is None or message is None:
-        return
-    try:
-        photos = await context.bot.get_user_profile_photos(user.id, limit=1)
-    except (TelegramError, AttributeError, TypeError):
-        return
-    if not getattr(photos, "total_count", 0):
-        return
-    try:
-        await message.reply_photo(
-            photo=photos.photos[0][-1].file_id,
-            caption=f"👤 <b>{ui.esc(user.first_name or user.username or 'Summoner')}</b>",
-            parse_mode=ParseMode.HTML,
-        )
-    except (BadRequest, TelegramError):
-        return
-
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     player = await guard(update, context)
     if player is None:
         return
-    await send_telegram_avatar(update, context)
     text = (
         f"🐉 <b>WELCOME TO {ui.esc(config.GAME_NAME)}</b> 🐉\n\n"
         f"Choose your home series and begin your journey. Each week brings new banners, "
@@ -384,7 +295,6 @@ async def cmd_starter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Your new hero is already set as your main. Use /team to build your squad.",
     ]
     await respond(update, "\n".join(lines), ui.back_keyboard())
-    await send_entity_art(update, db, "character", result["starter"], f"🎁 {ui.esc(character.get('name', 'Starter Hero'))}")
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -431,11 +341,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/leaderboard [wealth|players|arena|clans|raid] — wealth/collection is page 1\n/wealth — shortcuts to wealth leaderboard • /collection — per-series collection progress\n"
         "/travel &lt;series&gt; or /switch &lt;series&gt; • /series • /codex • /events\n"
         "/chapters [series] • /chapter [series] [number] — story battles\n"
-        "/explore — tap-through battle map • /heal — heal from a menu\n"
+        "/explore — tap-through battle map • /heal — heal from a menu\n/stamina — restore stamina with drinks and crystals\n"
         "/inv — inventory buttons • /top — rankings • /unstuck — clear a stuck battle\n"
         "/pity — gacha pity • /petsummon [1|10|50] — gem companion summon\n/element — element chart • /crown — avatars and clan hall\n"
-        "/pic [profile|clan|character|boss|summon|npc|gear|item|chapter] [name/id]\n"
-        "/banner • /settings • /about • /myid\n\n"
+        "/banner • /settings • /about • /myid • /userid @user (or reply)\n\n"
     )
     if config.is_admin(update.effective_user.id):
         text += (
@@ -465,6 +374,35 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user:
         await respond(update, f"🆔 Your Telegram user ID: <code>{user.id}</code>")
+
+
+async def cmd_userid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db = get_db(context)
+    reply = replied_user(update)
+    query = context.args[0] if context.args else None
+    if reply is not None:
+        target = db.ensure_player(reply.id, reply.username, reply.first_name)
+    elif query:
+        target = db.find_player(query)
+        if target is None:
+            await respond(update, "❌ No player found with that ID or username.")
+            return
+    else:
+        user = update.effective_user
+        if user is None:
+            return
+        target = db.ensure_player(user.id, user.username, user.first_name)
+    text = "\n".join([
+        "🆔 <b>PLAYER LOOKUP</b>",
+        "",
+        f"👤 Name: <b>{ui.esc(display_name(target))}</b>",
+        f"🔗 Username: {('@' + ui.esc(target['username'])) if target.get('username') else 'None'}",
+        f"🆔 User ID: <code>{int(target['user_id'])}</code>",
+        f"🏅 Rank: <b>{ui.esc(target.get('rank', 'Unknown'))}</b> • Level <b>{int(target.get('level', 1))}</b>",
+        "",
+        "Tip: /give or /trade also accept this ID or @username.",
+    ])
+    await respond(update, text, ui.back_keyboard())
 
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -531,7 +469,6 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     player = await guard(update, context)
     if player is None:
         return
-    await send_telegram_avatar(update, context)
     db = get_db(context)
     rows = [
         [InlineKeyboardButton("🎴 Summon", callback_data="menu:gacha"), InlineKeyboardButton("⚔️ Hunt", callback_data="menu:hunt")],
@@ -554,7 +491,6 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     player = db.require_player(update.effective_user.id)
     stats = game.effective_stats(db, update.effective_user.id)
     await respond(update, profile_text(db, update.effective_user.id), keyboard)
-    await send_card(update, images.profile_card(player, stats, len(db.characters(update.effective_user.id)), len(db.pets(update.effective_user.id)), db.clan(update.effective_user.id)), f"👤 {ui.esc(player.get('first_name') or 'Summoner')}")
 
 
 async def characters_view(update: Update, context: ContextTypes.DEFAULT_TYPE, args: list[str]) -> None:
@@ -690,7 +626,6 @@ async def character_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ])
     await respond(update, text, keyboard)
-    await send_entity_art(update, db, "character", found["id"], f"🎴 {ui.esc(found['name'])} — {rarity['name']}")
 
 
 async def cmd_character(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1241,7 +1176,6 @@ async def do_pull(update: Update, context: ContextTypes.DEFAULT_TYPE, series: st
     await respond(update, "\n".join(lines), ui.banner_keyboard(series))
     if result["results"]:
         card = result["results"][0]["character"]
-        await send_entity_art(update, get_db(context), "character", card["id"], f"🎴 {ui.esc(card['name'])}")
 
 
 async def cmd_pull(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1269,13 +1203,13 @@ async def cmd_wish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     character = result["character"]
     await respond(update, f"🐉 <b>SHENRON GRANTS YOUR WISH!</b>\n\n{ui.char_summary({**character, 'level': 1, 'stars': 1})}\n{'🆕 New hero!' if result['new'] else 'Duplicate converted into shards.'}", ui.main_menu_keyboard())
-    await send_entity_art(update, db, "character", character["id"], f"🐉 {ui.esc(character['name'])}")
 
 
-async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str = "all") -> None:
+async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str = "all", page: int = 1) -> None:
     player = await guard(update, context)
     if player is None:
         return
+    category = (category or "all").lower()
     if category == "daily":
         offers = game.daily_shop(get_db(context))
         lines = ["🌅 <b>DAILY SHOP</b>", ""]
@@ -1286,20 +1220,36 @@ async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category
         rows.extend(ui.shop_keyboard().inline_keyboard)
         await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
         return
+    labels = {"all": "All Items", "potions": "Potions", "summon": "Summoning", "materials": "Materials", "gear": "Gear"}
+    if category not in labels:
+        category = "all"
     entries = game.shop_catalog(category)
-    lines = [f"🛒 <b>SHOP — {category.title()}</b>", ""]
-    for entry in entries[:20]:
+    per_page = 8
+    total_pages = max(1, (len(entries) + per_page - 1) // per_page)
+    page = max(1, min(int(page or 1), total_pages))
+    start_index = (page - 1) * per_page
+    page_entries = entries[start_index:start_index + per_page]
+    lines = [f"🛒 <b>SHOP — {labels[category].upper()}</b>", f"Page <b>{page}/{total_pages}</b> • {len(entries)} items", ""]
+    if not page_entries:
+        lines.append("No items in this category.")
+    for entry in page_entries:
         lines.append(f"{entry['emoji']} <b>{ui.esc(entry['name'])}</b> — {ui.fmt(entry['price'])} {entry['currency']}\n   <code>{entry['id']}</code> • {ui.esc(entry['desc'])}")
-    if len(entries) > 20:
-        lines.append(f"\n...and {len(entries) - 20} more. Use /shop gear or /shop materials.")
     lines.append("\nTap an item to choose quantity, or use /buy &lt;id&gt; [qty].")
-    item_rows = []
-    for entry in entries[:8]:
-        item_rows.append([InlineKeyboardButton(f"{entry['emoji']} {entry['name']} — {ui.fmt(entry['price'])} {entry['currency']}", callback_data=f"shop:item:{entry['id']}")])
-    await respond(update, "\n".join(lines), InlineKeyboardMarkup(item_rows + list(ui.shop_keyboard().inline_keyboard)))
+    rows = []
+    for entry in page_entries:
+        rows.append([InlineKeyboardButton(f"{entry['emoji']} {entry['name']} — {ui.fmt(entry['price'])} {entry['currency']}", callback_data=f"shop:item:{entry['id']}:{category}:{page}")])
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"shop:page:{category}:{page - 1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"shop:page:{category}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.extend(ui.shop_keyboard().inline_keyboard)
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
-async def show_shop_item(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: str) -> None:
+async def show_shop_item(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: str, category: str = "all", page: int = 1) -> None:
     player = await guard(update, context)
     if player is None:
         return
@@ -1318,13 +1268,14 @@ async def show_shop_item(update: Update, context: ContextTypes.DEFAULT_TYPE, ite
     quantities = [1] if entry["kind"] == "gear" else [1, 10, 50]
     for qty in quantities:
         rows.append([InlineKeyboardButton(f"🛒 Buy {qty}", callback_data=f"shop:buy:{item_id}:{qty}")])
-    rows.append([InlineKeyboardButton("⬅️ Shop", callback_data="menu:shop")])
+    rows.append([InlineKeyboardButton("⬅️ Back to Shop", callback_data=f"shop:page:{category}:{page}")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def cmd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     category = context.args[0].lower() if context.args else "all"
-    await shop_view(update, context, category)
+    page = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else 1
+    await shop_view(update, context, category, page)
 
 
 async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1474,7 +1425,6 @@ async def hunt_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ])
     await respond(update, "\n".join(lines), keyboard)
-    await send_entity_art(update, get_db(context), "npc", npc["id"], f"👹 {ui.esc(npc['name'])} — Lv.{npc['level']}")
 
 
 async def cmd_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1581,7 +1531,6 @@ async def raid_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ])
     await respond(update, "\n".join(lines), keyboard)
-    await send_entity_art(update, db, "world", info["id"], f"🌍 {ui.esc(info['name'])} — Lv.{info['level']}")
 
 
 async def cmd_raid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1650,7 +1599,6 @@ async def cmd_clanraid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         [InlineKeyboardButton("⬅️ Clan", callback_data="menu:clan")],
     ])
     await respond(update, "\n".join(lines), keyboard)
-    await send_entity_art(update, db, "clanraid", info["id"], f"🏯 {ui.esc(info['name'])}")
 
 
 async def cmd_clanraid_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1804,7 +1752,6 @@ async def clan_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ])
     await respond(update, "\n".join(lines), keyboard)
     leader_name = next((m.get("first_name") or m.get("username") or str(m["user_id"]) for m in members if m["role"] == "leader"), "")
-    await send_entity_art(update, db, "clan", str(info.get("tag") or info["id"]).lower(), f"🏯 {ui.esc(info['name'])} [{ui.esc(info['tag'])}]", extra_keys=(str(info["id"]),), fallback_key=None)
 
 
 async def clan_leave_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2331,9 +2278,6 @@ async def pets_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows.append([InlineKeyboardButton("🥚 Hatch Egg", callback_data="pet:hatch:pet_egg"), InlineKeyboardButton("🌟 Hatch Premium", callback_data="pet:hatch:pet_egg_premium")])
     rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
-    featured = next((pet for pet in pets if pet.get("equipped")), pets[0] if pets else None)
-    if featured:
-        await send_entity_art(update, db, "pet", featured["id"], f"{featured['emoji']} {ui.esc(featured['name'])}")
 
 
 async def cmd_pets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2382,8 +2326,6 @@ async def cmd_pet_summon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     pet = result.get("pet", {})
     await respond(update, f"🥚 Hatched {pet.get('emoji', '🐾')} <b>{ui.esc(pet.get('name', 'Companion'))}</b>!\n{'🆕 New companion!' if result.get('new') else 'Duplicate companion reached a higher level.'}", ui.back_keyboard())
-    if pet.get("id"):
-        await send_entity_art(update, db, "pet", pet["id"], f"{pet.get('emoji', '🐾')} {ui.esc(pet.get('name', 'Companion'))}")
 
 
 def _parse_redeem_rewards(tokens: list[str]) -> tuple[list[dict], dict, str]:
@@ -2539,7 +2481,6 @@ async def pet_summon_result(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         [InlineKeyboardButton("🌟 Summon ×1 (1,000💎)", callback_data="petsummon:1"), InlineKeyboardButton("×10 (10,000💎)", callback_data="petsummon:10"), InlineKeyboardButton("×50 (50,000💎)", callback_data="petsummon:50")],
         [InlineKeyboardButton("🐾 Pets", callback_data="menu:pets"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ]))
-    await send_entity_art(update, db, "pet", pet.get("id", ""), f"{pet.get('emoji', '🐾')} {ui.esc(pet.get('name', 'Companion'))}")
 
 
 async def cmd_petsummon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2677,7 +2618,20 @@ async def cmd_give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not result.get("ok"):
         await respond(update, f"❌ {ui.esc(result.get('reason', 'Transfer failed.'))}")
         return
-    await respond(update, f"🎁 Sent <b>{ui.esc(result.get('label', 'asset'))}</b> to <b>{ui.esc(target.get('first_name') or target.get('username') or str(target['user_id']))}</b>.")
+    label = result.get("label", "asset")
+    target_name = display_name(target, str(target["user_id"]))
+    giver_name = display_name(player, str(player["user_id"]))
+    await respond(update, f"✅ <b>Gift sent!</b>\n🎁 {ui.esc(label)} → <b>{ui.esc(target_name)}</b>\nThey have been notified in DM.")
+    await notify_user(
+        context,
+        int(target["user_id"]),
+        "🎁 <b>YOU RECEIVED A GIFT!</b>\n\n"
+        f"👤 From: <b>{ui.esc(giver_name)}</b>\n"
+        f"🆔 ID: <code>{int(player['user_id'])}</code>\n\n"
+        f"🎁 You received: <b>{ui.esc(label)}</b>\n\n"
+        "Check /inventory to see your new items.",
+        ui.main_menu_keyboard(),
+    )
 
 
 async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2756,46 +2710,97 @@ async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await respond(update, "❌ Unknown grant kind.")
         return
     result = db.grant_asset(target["user_id"], kind, asset_id, qty)
-    await respond(update, f"✅ {ui.esc(result.get('message', 'Grant complete.'))}" if result.get("ok") else f"❌ {ui.esc(result.get('reason', 'Grant failed.'))}")
+    if not result.get("ok"):
+        await respond(update, f"❌ {ui.esc(result.get('reason', 'Grant failed.'))}")
+        return
+    message = result.get("message", "Grant complete.")
+    await respond(update, f"✅ {ui.esc(message)}")
+    await notify_user(
+        context,
+        int(target["user_id"]),
+        "🎁 <b>ADMIN GRANT RECEIVED</b>\n\n"
+        f"👤 From: <b>{ui.esc(display_name(admin, 'Admin'))}</b>\n\n"
+        f"🎁 {ui.esc(message)}\n\n"
+        "Use /inventory or /profile to view your account.",
+        ui.main_menu_keyboard(),
+    )
 
 
-def trade_summary(db: Database, trade: dict) -> str:
-    offers = db._trade_offers(trade)
+def _offer_label(db: Database, trade: dict, side: str, offer: dict) -> str:
+    kind = offer["kind"]
+    qty = int(offer.get("qty", 1))
+    if kind == "item":
+        label = data.ITEMS.get(offer["id"], {}).get("name", offer["id"])
+    elif kind == "character":
+        label = data.CHARACTERS.get(offer["id"], {}).get("name", offer["id"])
+    elif kind == "gear":
+        owner = int(trade["initiator_id"] if side == "initiator" else trade["target_id"])
+        gear = db.gear_instance(owner, int(offer["id"]))
+        base_gear = data.GEAR.get(offer.get("gear_id") or "", {})
+        label = f"{gear['name']} Lv.{gear['level']}" if gear else base_gear.get("name", f"Gear #{offer['id']}")
+    elif kind == "pet":
+        base = data.PETS.get(offer["id"], {})
+        label = f"{base.get('emoji', '🐾')} {base.get('name', offer['id'])}"
+    elif kind == "shard":
+        label = f"Shards: {data.CHARACTERS.get(offer['id'], {}).get('name', offer['id'])}"
+    else:
+        label = str(offer["id"])
+    if kind in ("yens", "gems", "crystals", "tickets", "stamina", "skill_points"):
+        return f"{ui.fmt(offer['id'])} {kind}"
+    return f"{label} x{qty}"
+
+
+def trade_summary(db: Database, trade: dict, offers: dict | None = None) -> str:
+    offers = offers or db._trade_offers(trade)
     initiator = db.player(int(trade["initiator_id"])) or {}
     target = db.player(int(trade["target_id"])) or {}
-    def name(row):
-        return row.get("first_name") or row.get("username") or str(row.get("user_id", "?"))
-    lines = [f"🤝 <b>TRADE #{trade['id']}</b>", f"{ui.esc(name(initiator))} ↔ {ui.esc(name(target))}", ""]
-    for side, title in (("initiator", name(initiator)), ("target", name(target))):
+    lines = [f"🤝 <b>TRADE #{trade['id']}</b>", f"{ui.esc(display_name(initiator))} ↔ {ui.esc(display_name(target))}", ""]
+    for side in ("initiator", "target"):
+        title = display_name(initiator if side == "initiator" else target)
         lines.append(f"<b>{ui.esc(title)} offers:</b>")
         if not offers[side]:
             lines.append("  • Nothing yet")
         for offer in offers[side]:
-            kind = offer["kind"]
-            qty = int(offer.get("qty", 1))
-            if kind == "item":
-                label = data.ITEMS.get(offer["id"], {}).get("name", offer["id"])
-            elif kind == "character":
-                label = data.CHARACTERS.get(offer["id"], {}).get("name", offer["id"])
-            elif kind == "gear":
-                owner = int(trade["initiator_id"] if side == "initiator" else trade["target_id"])
-                gear = db.gear_instance(owner, int(offer["id"]))
-                base_gear = data.GEAR.get(offer.get("gear_id") or "", {})
-                label = f"{gear['name']} Lv.{gear['level']}" if gear else base_gear.get("name", f"Gear #{offer['id']}")
-            elif kind == "pet":
-                label = data.PETS.get(offer["id"], {}).get("name", offer["id"])
-            elif kind == "shard":
-                label = f"Shards: {data.CHARACTERS.get(offer['id'], {}).get('name', offer['id'])}"
-            else:
-                label = str(offer["id"])
-            if kind in ("yens", "gems", "crystals", "tickets", "stamina", "skill_points"):
-                lines.append(f"  • {ui.fmt(offer['id'])} {kind}")
-            else:
-                lines.append(f"  • {ui.esc(label)} x{qty}")
+            lines.append(f"  • {ui.esc(_offer_label(db, trade, side, offer))}")
         lines.append(f"Confirmed: {'✅' if trade.get(f'{side}_ok') else '⏳'}")
         lines.append("")
-    lines.append("Add offers, then both players use /trade confirm.")
+    lines.append("Both players must add at least one item and press Confirm. Nothing is exchanged until both sides confirm.")
     return "\n".join(lines)
+
+
+def trade_complete_text(db: Database, trade: dict, offers: dict) -> str:
+    initiator = db.player(int(trade["initiator_id"])) or {}
+    target = db.player(int(trade["target_id"])) or {}
+    lines = ["✅ <b>TRADE COMPLETE!</b>", f"Trade #{trade['id']} finished fairly.", ""]
+    for side, giver, receiver in (
+        ("initiator", initiator, target),
+        ("target", target, initiator),
+    ):
+        for offer in offers.get(side, []):
+            lines.append(f"🎁 {ui.esc(display_name(giver))} → {ui.esc(display_name(receiver))}: {ui.esc(_offer_label(db, trade, side, offer))}")
+    return "\n".join(lines)
+
+
+async def _notify_trade_other(context: ContextTypes.DEFAULT_TYPE, db: Database, trade: dict, user_id: int, text: str, *, show_buttons: bool = True) -> None:
+    other_id = int(trade["target_id"]) if int(trade["initiator_id"]) == int(user_id) else int(trade["initiator_id"])
+    await notify_user(context, other_id, text, trade_keyboard(trade) if show_buttons else None)
+
+
+async def _start_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, db: Database, player: dict, target: dict) -> None:
+    result = db.trade_create(player["user_id"], target["user_id"])
+    if not result.get("ok"):
+        await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not create trade.'))}")
+        return
+    trade = result["trade"]
+    summary = trade_summary(db, trade)
+    keyboard = trade_keyboard(trade)
+    await respond(update, f"🤝 <b>Trade started with {ui.esc(display_name(target))}</b>\n\n{summary}", keyboard)
+    await notify_user(
+        context,
+        int(target["user_id"]),
+        f"🔔 <b>NEW TRADE REQUEST</b>\nFrom <b>{ui.esc(display_name(player))}</b>\n\n{summary}",
+        keyboard,
+    )
 
 
 async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2804,12 +2809,17 @@ async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     db = get_db(context)
     args = list(context.args)
+    reply = replied_user(update)
     if not args:
+        if reply is not None:
+            target = db.ensure_player(reply.id, reply.username, reply.first_name)
+            await _start_trade(update, context, db, player, target)
+            return
         trade = db.trade_for(player["user_id"])
         if trade is None:
-            await respond(update, "Usage: /trade &lt;user_id|@user&gt; — start a trade\n/trade add &lt;kind&gt; &lt;id|amount&gt; [qty]\n/trade remove &lt;kind&gt; [id]\n/trade confirm • /trade cancel • /trade view")
+            await respond(update, "Usage: /trade &lt;user_id|@user&gt; or reply to a message — start a trade\n/trade add &lt;kind&gt; &lt;id|amount&gt; [qty]\n/trade remove &lt;kind&gt; [id]\n/trade confirm • /trade cancel • /trade view")
         else:
-            await respond(update, trade_summary(db, trade))
+            await respond(update, trade_summary(db, trade), trade_keyboard(trade))
         return
     sub = args[0].lower()
     if sub in ("add", "remove"):
@@ -2825,127 +2835,112 @@ async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             kind, asset_id, qty = asset
             result = db.trade_add(player["user_id"], kind, asset_id, qty)
-        await respond(update, trade_summary(db, result["trade"]) if result.get("ok") else f"❌ {ui.esc(result.get('reason', 'Could not update the trade.'))}")
+        if not result.get("ok"):
+            await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not update the trade.'))}")
+            return
+        trade = result["trade"]
+        await respond(update, trade_summary(db, trade), trade_keyboard(trade))
+        await _notify_trade_other(context, db, trade, player["user_id"], f"🔔 <b>Trade updated</b> by {ui.esc(display_name(player))}.\n\n{trade_summary(db, trade)}")
         return
     if sub in ("confirm", "accept"):
         result = db.trade_confirm(player["user_id"])
         if not result.get("ok"):
             await respond(update, f"❌ {ui.esc(result.get('reason', 'Confirm failed.'))}")
         elif result.get("completed"):
-            await respond(update, "✅ <b>Trade complete!</b> Both offers were exchanged.")
+            text = trade_complete_text(db, result["trade"], result["offers"])
+            await respond(update, text)
+            await _notify_trade_other(context, db, result["trade"], player["user_id"], text, show_buttons=False)
         else:
-            await respond(update, "✅ Your side is confirmed. Waiting for the other player to confirm.")
+            trade = result["trade"]
+            await respond(update, f"✅ Your side is confirmed. Waiting for {ui.esc(display_name(db.player(int(trade['target_id']) if int(trade['initiator_id']) == int(player['user_id']) else int(trade['initiator_id']))))} to confirm.\n\n{trade_summary(db, trade)}", trade_keyboard(trade))
+            await _notify_trade_other(context, db, trade, player["user_id"], f"🔔 <b>{ui.esc(display_name(player))} confirmed the trade.</b> Confirm when you are ready.\n\n{trade_summary(db, trade)}")
         return
     if sub == "cancel":
+        trade = db.trade_for(player["user_id"])
         result = db.trade_cancel(player["user_id"])
-        await respond(update, "✅ Trade cancelled." if result.get("ok") else f"❌ {ui.esc(result.get('reason', 'No active trade.'))}")
+        if result.get("ok"):
+            await respond(update, "✅ Trade cancelled.")
+            if trade:
+                await _notify_trade_other(context, db, trade, player["user_id"], f"❌ <b>Trade cancelled</b> by {ui.esc(display_name(player))}.", show_buttons=False)
+        else:
+            await respond(update, f"❌ {ui.esc(result.get('reason', 'No active trade.'))}")
         return
     if sub in ("view", "info"):
         trade = db.trade_for(player["user_id"])
-        await respond(update, trade_summary(db, trade) if trade else "❌ No active trade.")
+        await respond(update, trade_summary(db, trade) if trade else "❌ No active trade.", trade_keyboard(trade) if trade else None)
         return
-    target = db.find_player(args[0])
+    if reply is not None:
+        target = db.ensure_player(reply.id, reply.username, reply.first_name)
+    else:
+        target = db.find_player(args[0])
     if target is None:
         await respond(update, "❌ Player not found. Use their ID, @username, or reply to them.")
         return
-    result = db.trade_create(player["user_id"], target["user_id"])
-    if not result.get("ok"):
-        await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not create trade.'))}")
-        return
-    await respond(update, f"🤝 Trade started with <b>{ui.esc(target.get('first_name') or target.get('username') or str(target['user_id']))}</b>.\nAdd offers with /trade add &lt;kind&gt; &lt;id|amount&gt; [qty], then /trade confirm.")
+    await _start_trade(update, context, db, player, target)
 
 
-async def cmd_pic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]) -> None:
     player = await guard(update, context)
     if player is None:
         return
+    action = parts[1] if len(parts) > 1 else "view"
     db = get_db(context)
-    args = list(context.args)
-    kind = (args[0].lower() if args else "profile")
-    query = " ".join(args[1:]).strip()
-    path = None
-    caption = ""
-    art_type = None
-    art_key = None
-    if kind in ("profile", "me", "stats"):
-        stats = game.effective_stats(db, player["user_id"])
-        clan = db.clan(player["user_id"])
-        path = images.profile_card(player, stats, len(db.characters(player["user_id"])), len(db.pets(player["user_id"])), clan)
-        caption = f"👤 {ui.esc(player.get('first_name') or 'Summoner')} — {stats['rank']}"
-        art_type, art_key = "profile", f"avatar_{player.get('avatar') or 'rookie'}"
-    elif kind in ("clan", "guild"):
-        clan = db.clan(player["user_id"])
-        if clan is None:
-            await respond(update, "❌ You are not in a clan.")
+    trade = db.trade_for(player["user_id"])
+    if trade is None:
+        await respond(update, "❌ You have no active trade.", ui.back_keyboard())
+        return
+    if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) != int(trade["id"]):
+        await respond(update, "❌ That trade is no longer active.", ui.back_keyboard())
+        return
+    if action == "view":
+        await respond(update, trade_summary(db, trade), trade_keyboard(trade))
+        return
+    if action == "petmenu":
+        side = db._trade_side(trade, player["user_id"])
+        offers = db._trade_offers(trade)
+        offered = {str(offer["id"]) for offer in offers.get(side or "", []) if offer.get("kind") == "pet"}
+        pets = [pet for pet in db.pets(player["user_id"]) if str(pet["pet_id"]) not in offered]
+        if not pets:
+            await respond(update, "🐾 You have no unoffered companions to trade.", trade_keyboard(trade))
             return
-        info = db.clan_info(clan["id"])
-        path = images.clan_card(clan, len(info["members"]), str(clan.get("leader_id", "")))
-        caption = f"🏯 {ui.esc(clan['name'])} [{ui.esc(clan['tag'])}]"
-        art_type, art_key = "clan", str(clan.get("tag") or clan["id"]).lower()
-    elif kind in ("character", "char", "hero"):
-        char = resolve_owned_character(db, player["user_id"], query) if query else next((c for c in db.characters(player["user_id"]) if c["id"] == player.get("equipped_char")), None)
-        if char is None and query:
-            char = resolve_any_character(query)
-        if char is None:
-            await respond(update, "❌ Character not found. Use /pic character &lt;name/id&gt;.")
+        rows = []
+        for pet in pets[:30]:
+            rows.append([InlineKeyboardButton(f"{pet['emoji']} {pet['name']} Lv.{pet['level']}", callback_data=f"trade:petadd:{trade['id']}:{pet['pet_id']}")])
+        rows.append([InlineKeyboardButton("⬅️ Back to Trade", callback_data=f"trade:view:{trade['id']}")])
+        await respond(update, "🐾 <b>Choose a companion to offer</b>\nTap one pet to add it to your side.", InlineKeyboardMarkup(rows))
+        return
+    if action == "petadd":
+        if len(parts) < 4:
+            await respond(update, "❌ Invalid companion.", trade_keyboard(trade))
             return
-        path = images.character_card(char)
-        caption = f"🎴 {ui.esc(char['name'])}"
-        art_type, art_key = "character", char["id"]
-    elif kind in ("boss", "summon", "summonboss"):
-        pool = data.SUMMON_BOSSES if kind != "boss" else [boss for bosses in data.BOSSES.values() for boss in bosses]
-        entity = next((item for item in pool if item["id"].lower() == query.lower()), None) or next((item for item in pool if query.lower() in item["name"].lower()), None)
-        if entity is None:
-            entity = next((item for item in pool if item.get("series") == player.get("travel")), pool[0])
-        card_kind = "summon" if kind != "boss" else "boss"
-        path = images.boss_card(entity, kind=card_kind)
-        caption = f"👹 {ui.esc(entity['name'])}"
-        art_type, art_key = ("summon" if kind != "boss" else "boss"), entity["id"]
-    elif kind in ("npc", "enemy", "enemies"):
-        entity = None
-        for series in data.SERIES:
-            entity = next((npc for npc in data.NPCS[series] if query and (npc["id"].lower() == query.lower() or query.lower() in npc["name"].lower())), None)
-            if entity:
-                break
-        if entity is None:
-            entity = next(iter(data.NPCS[player.get("travel", "dragonball")]))
-        path = images.enemy_card(entity)
-        caption = f"👺 {ui.esc(entity['name'])}"
-        art_type, art_key = "npc", entity["id"]
-    elif kind in ("gear", "weapon", "armor", "item"):
-        if kind == "item":
-            entity = resolve_item(query) if query else next(iter(data.ITEMS.values()))
-            if entity is None:
-                await respond(update, "❌ Item not found.")
-                return
-            path = images.item_card(entity)
-            caption = f"🎒 {ui.esc(entity['name'])}"
+        result = db.trade_add(player["user_id"], "pet", parts[3], 1)
+        if not result.get("ok"):
+            await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not offer that companion.'))}", trade_keyboard(trade))
+            return
+        trade = result["trade"]
+        await respond(update, trade_summary(db, trade), trade_keyboard(trade))
+        await _notify_trade_other(context, db, trade, player["user_id"], f"🔔 <b>Trade updated</b> by {ui.esc(display_name(player))}.\n\n{trade_summary(db, trade)}")
+        return
+    if action == "confirm":
+        result = db.trade_confirm(player["user_id"])
+        if not result.get("ok"):
+            await respond(update, f"❌ {ui.esc(result.get('reason', 'Confirm failed.'))}", trade_keyboard(trade))
+        elif result.get("completed"):
+            text = trade_complete_text(db, result["trade"], result["offers"])
+            await respond(update, text)
+            await _notify_trade_other(context, db, result["trade"], player["user_id"], text, show_buttons=False)
         else:
-            entity = data.GEAR.get(query) if query else next(iter(data.GEAR.values()))
-            if entity is None and query:
-                entity = next((item for item in data.GEAR.values() if query.lower() in item["name"].lower()), None)
-            if entity is None:
-                await respond(update, "❌ Gear not found.")
-                return
-            path = images.gear_card(entity)
-            caption = f"⚔️ {ui.esc(entity['name'])}"
-    elif kind in ("chapter", "story"):
-        chapters = data.CHAPTERS.get(player.get("travel", "dragonball"), [])
-        entity = next((chapter for chapter in chapters if query and (chapter["id"].lower() == query.lower() or query.lower() == str(chapter["number"]) or query.lower() in chapter["name"].lower())), None) or chapters[0]
-        path = images.chapter_card(entity)
-        caption = f"📖 {ui.esc(entity['name'])}"
-        art_type, art_key = "chapter", entity["id"]
-    else:
-        await respond(update, "Usage: /pic [profile|clan|character|boss|summon|npc|gear|item|chapter] [name/id]")
+            trade = result["trade"]
+            await respond(update, f"✅ Confirmed. Waiting for the other player.\n\n{trade_summary(db, trade)}", trade_keyboard(trade))
+            await _notify_trade_other(context, db, trade, player["user_id"], f"🔔 <b>{ui.esc(display_name(player))} confirmed the trade.</b> Confirm when ready.\n\n{trade_summary(db, trade)}")
         return
-    art = db.art_get(art_type, art_key) if art_type and art_key else None
-    if art is None and art_type == "profile":
-        art = db.art_get("profile", str(player["user_id"]))
-    if art and art.get("file_id"):
-        await send_file_id(update, art["file_id"], caption)
+    if action == "cancel":
+        result = db.trade_cancel(player["user_id"])
+        await respond(update, "✅ Trade cancelled." if result.get("ok") else f"❌ {ui.esc(result.get('reason', 'No active trade.'))}")
+        if result.get("ok"):
+            await _notify_trade_other(context, db, trade, player["user_id"], f"❌ <b>Trade cancelled</b> by {ui.esc(display_name(player))}.", show_buttons=False)
         return
-    if path:
-        await send_card(update, path, caption)
+    await respond(update, trade_summary(db, trade), trade_keyboard(trade))
 
 
 async def cmd_chapters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2960,7 +2955,7 @@ async def cmd_chapters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         number = int(chapter["number"])
         mark = "✅" if number in status["cleared"] else "▶️" if status["next"] and number == status["next"]["number"] else "🔒"
         lines.append(f"{mark} <b>Chapter {number}: {ui.esc(chapter['name'])}</b> — Lv.{chapter['level']}")
-    lines.append("\nUse /chapter to fight the next chapter, or /pic chapter &lt;number&gt; for a story card.")
+    lines.append("\nUse /chapter to fight the next chapter.")
     await respond(update, "\n".join(lines), ui.back_keyboard("menu:main"))
 
 
@@ -3250,6 +3245,32 @@ async def cmd_heal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await respond(update, heal_text(db, update.effective_user.id), InlineKeyboardMarkup(rows))
 
 
+async def cmd_stamina(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    db.refresh_stamina(update.effective_user.id)
+    player = db.require_player(update.effective_user.id)
+    items = [item for item in db.items(update.effective_user.id) if item.get("kind") == "stamina" and int(item.get("qty", 0)) > 0]
+    lines = [
+        "⚡ <b>STAMINA STATION</b>",
+        f"Stamina: {ui.percent_bar(player['stamina'], player['max_stamina'], 16)} {player['stamina']}/{player['max_stamina']}",
+        f"Regenerates every {config.STAMINA_REGEN_SECONDS // 60} minutes.",
+        "",
+    ]
+    rows = []
+    if items:
+        for item in items[:5]:
+            lines.append(f"{item['emoji']} {ui.esc(item['name'])} x{item['qty']} — restores {ui.fmt(item['value'])} stamina")
+            rows.append([InlineKeyboardButton(f"{item['emoji']} Use {item['name']} x{item['qty']}", callback_data=f"stamina:use:{item['item_id']}")])
+    else:
+        lines.append("No stamina items. Buy them from the shop below.")
+    lines.append("\nShop: /shop potions — Stamina Drink, Stamina Crystal, Feast of Tempest.")
+    rows.append([InlineKeyboardButton("🛒 Buy Stamina Items", callback_data="shop:potions"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
 async def cmd_pity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     player = await guard(update, context)
     if player is None:
@@ -3382,7 +3403,7 @@ async def crown_art_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "",
         "Reply to a photo with: <code>/upload NAME</code>",
         "Example: <code>/upload Frieza</code> or <code>/upload boss Frieza</code>",
-        "Use <code>/pic &lt;type&gt; &lt;name&gt;</code> to preview. Custom art overrides generated cards.",
+        "Custom art saves are kept for compatibility but images are no longer sent.",
     ])
     art_buttons = [
         InlineKeyboardButton(labels.get(entity_type, entity_type.title()), callback_data=f"art:list:{entity_type}")
@@ -3433,7 +3454,7 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     entity_type, entity_key, name = target
     db.art_set(entity_type, entity_key, name, file_id, update.effective_user.id)
-    await respond(update, f"👑 Custom art saved for <b>{ui.esc(name)}</b> ({entity_type}). /pic {entity_type} {ui.esc(name)} will use it.")
+    await respond(update, f"👑 Custom art saved for <b>{ui.esc(name)}</b> ({entity_type}).")
 
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3555,6 +3576,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("clanraid", "Clan raid info or actions"),
     ("explore", "Button-based exploration menu"),
     ("heal", "Heal with items and buttons"),
+    ("stamina", "Restore stamina with items"),
     ("arena", "Random arena duel"),
     ("duel", "Challenge a player"),
     ("leaderboard", "Player, arena, clan and raid rankings"),
@@ -3584,7 +3606,6 @@ COMMANDS: list[tuple[str, str]] = [
     ("market_buy", "Buy a listing"),
     ("give", "Send owned assets to a player"),
     ("trade", "Trade assets with a player"),
-    ("pic", "Generate a character or boss card"),
     ("daily", "Claim daily reward"),
     ("weekly", "Claim weekly reward"),
     ("monthly", "Claim monthly reward"),
@@ -3595,7 +3616,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("pets", "Companion collection"),
     ("pet_equip", "Equip a companion"),
     ("pet_feed", "Feed and level a companion"),
-    ("pet_summon", "Hatch a companion egg"),
+    ("userid", "Look up a player's Telegram ID"),
     ("petsummon", "Summon companions with gems"),
     ("dungeon", "Enter a series dungeon"),
     ("fish", "Fish for materials"),
@@ -3624,6 +3645,8 @@ HANDLERS = {
     "help": cmd_help,
     "about": cmd_about,
     "myid": cmd_myid,
+    "userid": cmd_userid,
+    "id": cmd_userid,
     "register": cmd_register,
     "profile": cmd_profile,
     "stats": cmd_profile,
@@ -3710,7 +3733,6 @@ HANDLERS = {
     "give": cmd_give,
     "trade": cmd_trade,
     "grant": cmd_grant,
-    "pic": cmd_pic,
     "daily": cmd_daily,
     "weekly": cmd_weekly,
     "monthly": cmd_monthly,
@@ -3731,6 +3753,7 @@ HANDLERS = {
     "dungeon": cmd_dungeon,
     "explore": cmd_explore,
     "heal": cmd_heal,
+    "stamina": cmd_stamina,
     "pity": cmd_pity,
     "element": cmd_element,
     "unstuck": cmd_unstuck,
@@ -3762,6 +3785,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     payload = query.data or ""
     parts = payload.split(":")
     key = parts[0]
+    if key == "trade":
+        await handle_trade_callback(update, context, parts)
+        return
     if key == "menu":
         target = parts[1] if len(parts) > 1 else "main"
         if target == "main":
@@ -3825,9 +3851,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await cmd_npc(update, context)
         elif target == "travel":
             await travel_view(update, context)
-        elif target == "clanpic":
-            context.args = ["clan"]
-            await cmd_pic(update, context)
         elif target == "quests":
             await quests_view(update, context, "daily")
         elif target == "leaderboard":
@@ -3852,7 +3875,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if key == "shop":
         action = parts[1] if len(parts) > 1 else "all"
         if action == "item" and len(parts) > 2:
-            await show_shop_item(update, context, parts[2])
+            category = parts[3] if len(parts) > 3 and parts[3] in ("all", "potions", "summon", "materials", "gear") else "all"
+            page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 1
+            await show_shop_item(update, context, parts[2], category, page)
+            return
+        if action == "page" and len(parts) > 3:
+            category = parts[2] if parts[2] in ("all", "potions", "summon", "materials", "gear", "daily") else "all"
+            page = int(parts[3]) if parts[3].isdigit() else 1
+            await shop_view(update, context, category, page)
             return
         if action == "buy" and len(parts) > 3:
             player = await guard(update, context)
@@ -4068,9 +4098,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         player = await guard(update, context)
         if player is None:
             return
-        action = parts[1] if len(parts) > 1 else "a"
+        raw_action = parts[1] if len(parts) > 1 else "a"
+        action = {
+            "a": "attack", "g": "guard", "d": "guard", "s": "skill",
+            "u": "ultimate", "t": "transform", "x": "switch", "p": "potion", "f": "flee",
+        }.get(raw_action, raw_action)
         battle_id = parts[-1]
-        payload = parts[2] if action in ("s", "p") and len(parts) > 3 else None
+        payload = parts[2] if raw_action in ("s", "p") and len(parts) > 3 else None
         result = battle.act(get_db(context), update.effective_user.id, battle_id, action, payload)
         if not result["ok"]:
             await respond(update, f"❌ {ui.esc(result['reason'])}", ui.back_keyboard())
@@ -4092,6 +4126,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         game.travel(get_db(context), update.effective_user.id, series)
         await respond(update, f"🌍 Traveled to {series_name(series)} — <b>{data.SERIES[series]['home']}</b>.", ui.main_menu_keyboard())
+        return
+    if key == "stamina" and len(parts) > 2 and parts[1] == "use":
+        player = await guard(update, context)
+        if player is None:
+            return
+        result = game.use_item(get_db(context), update.effective_user.id, parts[2], 1)
+        if not result["ok"]:
+            await respond(update, f"❌ {ui.esc(result['reason'])}", ui.back_keyboard())
+            return
+        await cmd_stamina(update, context)
         return
     if key == "heal" and len(parts) > 2 and parts[1] == "use":
         player = await guard(update, context)
@@ -4191,7 +4235,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 lines.append(f"{marker} {ui.esc(entry.get('name', key))} — <code>{ui.esc(key)}</code>")
             lines.append("")
             lines.append("Reply to a photo with <code>/upload TYPE NAME</code> to add art.")
-            lines.append("Preview with <code>/pic TYPE NAME</code>.")
         else:
             lines.append("No art slots exist for this category yet.")
             lines.append("Create the entity or clan first, then upload art.")
@@ -4307,8 +4350,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await respond(update, f"🥚 Hatched {pet.get('emoji', '🐾')} <b>{ui.esc(pet.get('name', 'Companion'))}</b>!", InlineKeyboardMarkup([
                 [InlineKeyboardButton("🐾 Pets", callback_data="menu:pets"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
             ]))
-            if pet.get("id"):
-                await send_entity_art(update, db, "pet", pet["id"], f"{pet.get('emoji', '🐾')} {ui.esc(pet.get('name', 'Companion'))}")
             return
         await pets_view(update, context)
         return
