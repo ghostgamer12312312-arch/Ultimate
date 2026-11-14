@@ -7,8 +7,9 @@ import time
 import uuid
 
 try:
-    from . import data, game, ui
+    from . import config, data, game, ui
 except ImportError:
+    import config
     import data
     import game
     import ui
@@ -240,7 +241,7 @@ def start_elite(db, user_id: int, series: str | None = None) -> dict:
     })
     db.spend(user_id, stamina=12)
     db.take_item(user_id, "elite_key", 1)
-    enemy = _enemy(elite["name"], game.enemy_from_npc(elite), level=elite["level"], art="boss", art_key=elite["id"])
+    enemy = _enemy(elite["name"], game.enemy_from_npc(elite), level=elite["level"], art="npc", art_key=npc["id"])
     drops = {"shard_rare": 2, "forge_core": 1}
     if random.random() < 0.05:
         drops["awakening_stone"] = 1
@@ -265,7 +266,7 @@ def start_dungeon(db, user_id: int, series: str | None = None) -> dict:
         return {"ok": False, "reason": "Need 25 stamina to enter the dungeon."}
     index = max(0, min(len(floors) - 1, int(player["level"]) // 20))
     floor = floors[index]
-    enemy = _enemy(floor["name"], game.enemy_from_boss(floor, 0.70), level=floor["level"], art="boss", art_key=floor["id"])
+    enemy = _enemy(floor["name"], game.enemy_from_boss(floor, 0.70), level=floor["level"], art="map", art_key=floor["id"])
     drops = {floor["drop"]: 2, "forge_core": 1}
     if random.random() < 0.20:
         drops["awakening_stone"] = 1
@@ -305,7 +306,7 @@ def start_chapter(db, user_id: int, series: str | None = None, chapter: int | No
         return {"ok": False, "reason": "Need 15 stamina to fight this chapter."}
     enemy = _enemy(
         chapter_data["enemy"]["name"], game.enemy_from_npc(chapter_data["enemy"]),
-        level=chapter_data["enemy"].get("level", 1), art="npc", art_key=chapter_data["enemy"].get("id", ""),
+        level=chapter_data["enemy"].get("level", 1), art="chapter", art_key=chapter_data["id"],
     )
     meta = {
         "kind": "chapter", "series": series, "chapter": chapter_data, "win_field": "boss_kills",
@@ -388,7 +389,7 @@ def start_clanraid(db, user_id: int) -> dict:
         db.take_item(user_id, "raid_token", 1)
     info = data.CLAN_RAID_BY_ID.get(raid_row["raid_id"], data.CLAN_RAIDS[0])
     boss = {"name": info["name"], "hp": info["hp"], "atk": info["atk"], "def": info["def"], "spd": info["spd"], "element": info["element"]}
-    enemy = _enemy(info["name"], game.enemy_from_boss(boss, 0.16), level=info.get("level", 1), art="world", art_key=info["id"])
+    enemy = _enemy(info["name"], game.enemy_from_boss(boss, 0.16), level=info.get("level", 1), art="clanraid", art_key=info["id"])
     enemy["hp"] = max(1, int(raid_row["hp"]))
     enemy["max_hp"] = max(1, int(raid_row["max_hp"]))
     meta = {"kind": "clanraid", "series": info.get("series"), "shared": "clanraid", "raid": info, "damage": 0}
@@ -488,7 +489,7 @@ def _heal_items(db, user_id: int) -> list[dict]:
 
 def _grant(db, user_id: int, rewards: dict, drops: dict) -> None:
     if rewards:
-        db.grant_rewards(user_id, rewards)
+        db.grant_rewards(user_id, rewards, scale=(config.BATTLE_REWARD_SCALE_MIN, config.BATTLE_REWARD_SCALE_MAX))
     for item_id, qty in (drops or {}).items():
         if qty > 0 and item_id in data.ITEMS:
             db.add_item(user_id, item_id, int(qty))
@@ -562,6 +563,20 @@ def _finish(db, user_id: int, battle: dict, outcome: str) -> dict:
             rewards = {"exp": max(20, int(meta.get("damage", 0)) // 8)}
     if won and meta.get("persistent") == "boss":
         db.reset_boss(user_id, meta["boss"]["id"])
+    if won:
+        try:
+            drop_rate = float(game.effective_stats(db, user_id).get("drop_rate", 0.0))
+        except Exception:
+            drop_rate = 0.0
+        if drop_rate > 0 and drops:
+            for item_id, qty in list(drops.items()):
+                drops[item_id] = max(1, int(round(int(qty) * (1.0 + drop_rate))))
+        if drop_rate > 0 and random.random() < drop_rate:
+            bonus_item = random.choice([
+                item_id for item_id in ("crystal_shard", "forge_core", "senzu_small", "exp_scroll", "skill_scroll")
+                if item_id in data.ITEMS
+            ])
+            drops[bonus_item] = int(drops.get(bonus_item, 0)) + 1
     _grant(db, user_id, rewards, drops)
     _record(db, user_id, battle, won)
     state["status"] = "finished"
@@ -697,13 +712,34 @@ def act(db, user_id: int, battle_id: str, action: str, payload: str | None = Non
             state["log"].append("🌟 Ultimate unleashed!")
         else:
             state["ult"] = min(100, int(state.get("ult", 0)) + 10)
-        attacker = player
+        attacker = dict(player)
         if int(state.get("transform", 0)) > 0:
-            attacker = dict(player)
             attacker["atk"] = int(float(player["atk"]) * 1.30)
         if int(state.get("almighty", 0)) > 0:
-            attacker = dict(attacker)
             attacker["crit"] = float(attacker.get("crit", 0.08)) + 0.25
+        bonus = (skill or {}).get("bonus") or {}
+        if bonus:
+            if bonus.get("atk_pct"):
+                attacker["atk"] = int(float(attacker["atk"]) * (1.0 + float(bonus["atk_pct"])))
+            if bonus.get("crit"):
+                attacker["crit"] = float(attacker.get("crit", 0.08)) + float(bonus["crit"])
+            if bonus.get("spd_pct"):
+                attacker["spd"] = int(float(attacker["spd"]) * (1.0 + float(bonus["spd_pct"])))
+            if bonus.get("heal_hp") and int(player["hp"]) > 0:
+                low = int(bonus.get("heal_hp_min", bonus["heal_hp"]))
+                high = int(bonus.get("heal_hp_max", bonus["heal_hp"]))
+                heal = rng.randint(min(low, high), max(low, high))
+                before = int(player["hp"])
+                player["hp"] = min(int(player["max_hp"]), before + heal)
+                if player["hp"] > before:
+                    state["log"].append(f"💚 {skill['name']} restored {player['hp'] - before:,} HP.")
+            if bonus.get("hp_flat"):
+                amount = int(bonus["hp_flat"])
+                player["max_hp"] = int(player["max_hp"]) + amount
+                player["hp"] = int(player["hp"]) + amount
+                state["log"].append(f"❤️ {skill['name']} increased Max HP by {amount:,}.")
+            if bonus.get("def_pct"):
+                player["def"] = int(float(player["def"]) * (1.0 + float(bonus["def_pct"])))
         damage, crit, dodged = game.attack_damage(attacker, enemy, skill, rng)
         if dodged:
             state["log"].append(f"💨 {enemy['name']} dodged your attack!")

@@ -33,8 +33,8 @@ def _passive_bonus(skill_ids: list[str], scale: float = 1.0) -> dict:
 def scaled_character(character: dict) -> dict:
     level = int(character.get("level", 1))
     stars = int(character.get("stars", 1))
-    level_mult = 1.0 + 0.075 * (level - 1)
-    star_mult = 1.0 + 0.12 * (stars - 1)
+    level_mult = 1.0 + 0.060 * (level - 1)
+    star_mult = 1.0 + 0.10 * (stars - 1)
     awaken_mult = 1.06 if character.get("awakened") else 1.0
     mult = level_mult * star_mult * awaken_mult
     return {
@@ -133,6 +133,15 @@ def effective_stats(db, user_id: int, main_id: str | None = None) -> dict:
         stat = {"hp_pct": "hp", "atk_pct": "atk", "def_pct": "def", "spd_pct": "spd"}.get(key)
         if stat:
             base[stat] *= 1.0 + pct
+    for key, value in passives.items():
+        if key == "hp_flat":
+            base["hp"] += float(value)
+    equipped_skills = [skill for skill in db.skills(user_id) if skill.get("equipped")]
+    equipped_bonus: dict[str, float] = {}
+    for skill in equipped_skills:
+        for key, value in (skill.get("bonus") or {}).items():
+            if key in ("drop_rate", "gacha_luck", "crit", "dodge"):
+                equipped_bonus[key] = equipped_bonus.get(key, 0.0) + float(value)
     pet = next((item for item in db.pets(user_id) if item.get("equipped")), None)
     if pet:
         pet_scale = 1.0 + 0.02 * (int(pet.get("level", 1)) - 1)
@@ -159,8 +168,10 @@ def effective_stats(db, user_id: int, main_id: str | None = None) -> dict:
         "spd": max(1, int(base["spd"])),
         "mp": max_mp,
         "max_mp": max_mp,
-        "crit": min(0.65, 0.08 + attributes["luck"] * 0.0008 + passives.get("crit", 0.0) + title.get("crit", 0.0)),
-        "dodge": min(0.45, 0.04 + attributes["agility"] * 0.0006 + passives.get("dodge", 0.0) + title.get("dodge", 0.0)),
+        "crit": min(0.65, 0.08 + attributes["luck"] * 0.0008 + passives.get("crit", 0.0) + title.get("crit", 0.0) + equipped_bonus.get("crit", 0.0)),
+        "dodge": min(0.45, 0.04 + attributes["agility"] * 0.0006 + passives.get("dodge", 0.0) + title.get("dodge", 0.0) + equipped_bonus.get("dodge", 0.0)),
+        "drop_rate": min(0.75, passives.get("drop_rate", 0.0) + equipped_bonus.get("drop_rate", 0.0) + title.get("drop_rate", 0.0)),
+        "gacha_luck": min(0.30, passives.get("gacha_luck", 0.0) + equipped_bonus.get("gacha_luck", 0.0) + title.get("gacha_luck", 0.0)),
         "element": element,
         "skills": active_skills,
         "series": main["series"] if main else player.get("travel", "dragonball"),
@@ -183,10 +194,16 @@ def skill_tags(skill: dict) -> list[str]:
             tags.add("REGENERATION")
         if bonus.get("def_pct"):
             tags.add("DEFENSE")
-        if bonus.get("crit") or bonus.get("dodge"):
+        if bonus.get("crit") or bonus.get("dodge") or bonus.get("gacha_luck"):
             tags.add("LUCK")
         if bonus.get("spd_pct"):
             tags.add("LUCK")
+        if bonus.get("heal_hp") or bonus.get("hp_flat") or bonus.get("hp_pct"):
+            tags.add("REGENERATION")
+        if bonus.get("drop_rate"):
+            tags.add("DROP RATE")
+        if bonus.get("gacha_luck"):
+            tags.add("PULL RATE")
     else:
         tags.add("ATTACK")
     lower = f"{skill.get('id', '')} {skill.get('name', '')}".lower()
@@ -205,6 +222,13 @@ def skill_tags(skill: dict) -> list[str]:
     return [tag for tag in SKILL_TAG_ORDER if tag in tags] or ["ATTACK"]
 
 
+def _pct_text(value: float) -> str:
+    pct = float(value) * 100
+    if abs(pct - round(pct)) < 0.05:
+        return f"{int(round(pct))}%"
+    return f"{pct:.1f}%"
+
+
 def skill_effect(skill: dict) -> str:
     parts: list[str] = []
     if skill.get("type") == "active":
@@ -214,21 +238,29 @@ def skill_effect(skill: dict) -> str:
         if cooldown:
             parts.append(f"{cooldown}-turn cooldown")
     for key, value in (skill.get("bonus") or {}).items():
-        pct = float(value) * 100
+        if key in ("heal_hp_min", "heal_hp_max"):
+            continue
+        if key == "heal_hp":
+            low = int((skill.get("bonus") or {}).get("heal_hp_min", value))
+            high = int((skill.get("bonus") or {}).get("heal_hp_max", value))
+            parts.append(f"Restores {low}-{high} HP on use" if low != high else f"Restores {int(value)} HP on use")
+            continue
+        if key == "hp_flat":
+            parts.append(f"+{int(value)} Max HP")
+            continue
         label = {
             "atk_pct": "ATK", "def_pct": "DEF", "hp_pct": "Max HP", "spd_pct": "SPD",
-            "crit": "Crit chance", "dodge": "Dodge chance",
+            "crit": "Crit chance", "dodge": "Dodge chance", "drop_rate": "Drop rate",
+            "gacha_luck": "Gacha luck",
         }.get(key, key.replace("_", " ").title())
-        parts.append(f"+{pct:.1f}% {label}")
+        parts.append(f"+{_pct_text(value)} {label}")
     lower = f"{skill.get('id', '')} {skill.get('name', '')}".lower()
-    if "phoenix" in lower:
-        parts.append("heals 15% Max HP when used")
     if "abyss_requiem" in lower:
         parts.append("restores 25 MP when used")
     if "world_breaker" in lower:
         parts.append("shields the next enemy hit")
     if "almighty" in lower:
-        parts.append("+25% Crit Luck (3 turns) and +10% Mythic Pull Rate")
+        parts.append("+25% Crit Luck (3 turns)")
     if not parts:
         parts.append(str(skill.get("description") or "No bonus effect."))
     return " • ".join(parts)
@@ -676,10 +708,13 @@ def gacha(db, user_id: int, banner_id: str = "dragonball", count: int = 1) -> di
     results = []
     rng = random.Random()
     pity = int(player["pity"])
-    pull_boost = 0.10 if any(
-        skill["id"] == "the_almighty" and skill.get("equipped")
-        for skill in db.skills(user_id)
-    ) else 0.0
+    try:
+        pull_boost = float(effective_stats(db, user_id).get("gacha_luck", 0.0))
+    except Exception:
+        pull_boost = 0.0
+    if any(skill["id"] == "the_almighty" and skill.get("equipped") for skill in db.skills(user_id)):
+        pull_boost += 0.04
+    pull_boost = min(0.25, pull_boost)
     for _ in range(count):
         rarity = _pick_rarity(rng, pity, pull_boost)
         char_id = _pick_character(banner["series"], rarity, banner, rng)
@@ -706,6 +741,47 @@ def gacha(db, user_id: int, banner_id: str = "dragonball", count: int = 1) -> di
     db.set_field(user_id, "pity", pity)
     return {"ok": True, "banner": banner, "results": results, "payment": payment, "pity": pity}
 
+
+
+PET_SUMMON_WEIGHTS = {
+    "common": 620.0, "rare": 280.0, "epic": 78.0,
+    "legendary": 18.0, "mythic": 3.5, "divine": 0.5,
+}
+
+
+def pet_summon(db, user_id: int, count: int = 1) -> dict:
+    count = int(count)
+    cost = config.PET_SUMMON_COSTS.get(count)
+    if cost is None:
+        return {"ok": False, "reason": "Choose 1, 10, or 50 summons."}
+    player = db.require_player(user_id)
+    if int(player["gems"]) < cost:
+        return {"ok": False, "reason": f"Need {cost:,} gems for {count} summon(s)."}
+    if not db.spend(user_id, gems=cost):
+        return {"ok": False, "reason": "Not enough gems."}
+    import random
+    rng = random.Random()
+    pity = int(player.get("pet_pity", 0) or 0)
+    rarities = list(PET_SUMMON_WEIGHTS)
+    weights = [PET_SUMMON_WEIGHTS[rarity] for rarity in rarities]
+    results = []
+    for _ in range(count):
+        if pity >= config.PET_SUMMON_PITY - 1:
+            rarity = "divine"
+        else:
+            rarity = rng.choices(rarities, weights=weights)[0]
+        pool = [pid for pid, pet in data.PETS.items() if pet["rarity"] == rarity]
+        if not pool:
+            pool = list(data.PETS)
+        pet_id = rng.choice(pool)
+        new, base = db.add_pet(user_id, pet_id)
+        results.append({"pet": base, "new": new, "rarity": rarity})
+        if rarity in ("mythic", "divine"):
+            pity = 0
+        else:
+            pity += 1
+    db.set_field(user_id, "pet_pity", pity)
+    return {"ok": True, "results": results, "pity": pity, "cost": cost, "count": count}
 
 def wish(db, user_id: int, series: str | None = None) -> dict:
     if not db.consume_dragon_balls(user_id):

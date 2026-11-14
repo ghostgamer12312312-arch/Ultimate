@@ -95,6 +95,8 @@ CREATE TABLE IF NOT EXISTS players (
     boss_kills INTEGER NOT NULL DEFAULT 0,
     gacha_pulls INTEGER NOT NULL DEFAULT 0,
     pity INTEGER NOT NULL DEFAULT 0,
+    pet_pity INTEGER NOT NULL DEFAULT 0,
+    starter_claimed INTEGER NOT NULL DEFAULT 0,
     raid_damage INTEGER NOT NULL DEFAULT 0,
     total_battles INTEGER NOT NULL DEFAULT 0,
     wins INTEGER NOT NULL DEFAULT 0,
@@ -342,6 +344,23 @@ CREATE TABLE IF NOT EXISTS custom_art (
     PRIMARY KEY(entity_type, entity_key)
 );
 
+CREATE TABLE IF NOT EXISTS redeem_codes (
+    code TEXT PRIMARY KEY,
+    rewards TEXT NOT NULL,
+    max_uses INTEGER NOT NULL DEFAULT 1,
+    used_count INTEGER NOT NULL DEFAULT 0,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS redeem_claims (
+    code TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY(code, user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_active_battles_user ON active_battles(user_id);
 CREATE INDEX IF NOT EXISTS idx_custom_art_type ON custom_art(entity_type);
 CREATE INDEX IF NOT EXISTS idx_characters_user ON characters(user_id);
@@ -359,7 +378,7 @@ PLAYER_COLUMNS = {
     "current_hp", "atk", "def", "spd", "skill_points", "equipped_char", "team",
     "weapon", "armor", "accessory", "title", "avatar", "clan_id", "daily_day",
     "daily_streak", "weekly_week", "monthly_month", "npc_streak", "best_streak",
-    "boss_kills", "gacha_pulls", "pity", "raid_damage", "total_battles", "wins",
+    "boss_kills", "gacha_pulls", "pity", "pet_pity", "starter_claimed", "raid_damage", "total_battles", "wins",
     "losses", "pvp_wins", "arena_rating", "clan_donation", "market_sales",
     "travel", "banned", "is_admin", "last_seen",
 }
@@ -435,6 +454,8 @@ class Database:
                 "boss_kills": "INTEGER NOT NULL DEFAULT 0",
                 "gacha_pulls": "INTEGER NOT NULL DEFAULT 0",
                 "pity": "INTEGER NOT NULL DEFAULT 0",
+                "pet_pity": "INTEGER NOT NULL DEFAULT 0",
+                "starter_claimed": "INTEGER NOT NULL DEFAULT 0",
                 "raid_damage": "INTEGER NOT NULL DEFAULT 0",
                 "total_battles": "INTEGER NOT NULL DEFAULT 0",
                 "wins": "INTEGER NOT NULL DEFAULT 0",
@@ -503,18 +524,20 @@ class Database:
         return self.player(user_id) or {}
 
     def grant_starter_pack(self, user_id: int, series: str | None = None) -> dict:
-        """Give a fresh account a strong, randomized starter bundle."""
+        """Claim the one-time starter pack for an account."""
         import random
 
-        series = series if series in data.SERIES else config.DEFAULT_SERIES
-        starter = data.STARTER_CHARACTERS[series]
+        player = self.player(user_id)
+        if player is not None and int(player.get("starter_claimed", 0) or 0):
+            return {"ok": False, "reason": "You already claimed your starter pack."}
+        pool = [
+            cid for cid, character in data.CHARACTERS.items()
+            if character.get("form") == "Base" and character.get("rarity") not in ("divine", "mythic")
+        ] or [cid for cid in data.CHARACTERS if data.CHARACTERS[cid].get("rarity") not in ("divine", "mythic")]
+        starter = random.choice(pool)
         self.add_character(user_id, starter, level=5, stars=1)
-        pool = [cid for cid in data.STARTER_CHARACTER_POOL.get(series, []) if cid != starter]
-        extra = random.choice(pool) if pool else starter
-        self.add_character(user_id, extra, level=5, stars=1)
-        team = list(dict.fromkeys([starter, extra]))[: config.MAX_TEAM]
-        self.set_field(user_id, "equipped_char", team[0])
-        self.set_field(user_id, "team", json.dumps(team))
+        self.set_field(user_id, "equipped_char", starter)
+        self.set_field(user_id, "team", json.dumps([starter]))
         bundle = {
             "senzu_small": 12, "senzu_large": 4, "stamina_drink": 8,
             "exp_scroll": 5, "exp_tome": 2, "gacha_ticket": 3,
@@ -529,14 +552,102 @@ class Database:
                 self.add_item(user_id, item_id, qty)
         gear_ids = []
         for slot in ("weapon", "armor", "accessory"):
-            pool = data.STARTER_GEAR_POOL.get(slot, [])
-            if pool:
-                gear_ids.append(self.grant_gear(user_id, random.choice(pool), 1))
+            gear_pool = data.STARTER_GEAR_POOL.get(slot, [])
+            if gear_pool:
+                gear_ids.append(self.grant_gear(user_id, random.choice(gear_pool), 1))
         for instance_id, slot in zip(gear_ids, ("weapon", "armor", "accessory")):
             self.equip_gear(user_id, instance_id)
         if not self.pets(user_id):
             self.add_pet(user_id, data.STARTER_PET)
-        return {"starter": starter, "extra": extra, "gear": gear_ids, "items": bundle}
+        yens = random.randint(1000, 10000)
+        gems = random.randint(200, 800)
+        crystals = random.randint(10, 50)
+        self.give(user_id, yens=yens, gems=gems, crystals=crystals)
+        self.set_field(user_id, "starter_claimed", 1)
+        return {
+            "ok": True, "starter": starter, "gear": gear_ids, "items": bundle,
+            "yens": yens, "gems": gems, "crystals": crystals,
+        }
+
+    def claim_starter_pack(self, user_id: int) -> dict:
+        return self.grant_starter_pack(user_id)
+
+    def redeem_code_create(self, created_by: int, code: str, rewards: list[dict], max_uses: int = 1, expires_at: str | None = None) -> dict:
+        code = (code or "").strip().upper()
+        if not code or len(code) > 32 or not all(ch.isalnum() or ch in "-_" for ch in code):
+            return {"ok": False, "reason": "Code must be 1-32 letters, numbers, - or _."}
+        if not rewards:
+            return {"ok": False, "reason": "A code needs at least one reward."}
+        max_uses = max(1, min(1000000, int(max_uses)))
+        with self.conn() as c:
+            if c.execute("SELECT 1 FROM redeem_codes WHERE code=?", (code,)).fetchone():
+                return {"ok": False, "reason": "That code already exists."}
+            c.execute(
+                "INSERT INTO redeem_codes(code, rewards, max_uses, used_count, created_by, created_at, expires_at) VALUES(?,?,?,0,?,?,?)",
+                (code, json.dumps(rewards, ensure_ascii=False), max_uses, int(created_by), _now(), expires_at),
+            )
+        return {"ok": True, "code": code, "rewards": rewards, "max_uses": max_uses, "expires_at": expires_at}
+
+    def redeem_code_info(self, code: str) -> dict | None:
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM redeem_codes WHERE code=?", ((code or "").strip().upper(),)).fetchone()
+        item = _row_to_dict(row)
+        if item:
+            try:
+                item["rewards"] = json.loads(item.get("rewards") or "[]")
+            except json.JSONDecodeError:
+                item["rewards"] = []
+        return item
+
+    def redeem_code_claim(self, user_id: int, code: str) -> dict:
+        code = (code or "").strip().upper()
+        if not code:
+            return {"ok": False, "reason": "Usage: /redeem <code>"}
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM redeem_codes WHERE code=?", (code,)).fetchone()
+            if row is None:
+                return {"ok": False, "reason": "Invalid or unknown code."}
+            if row["expires_at"]:
+                try:
+                    if datetime.fromisoformat(row["expires_at"]) < _utcnow():
+                        return {"ok": False, "reason": "That code has expired."}
+                except ValueError:
+                    pass
+            if int(row["used_count"]) >= int(row["max_uses"]):
+                return {"ok": False, "reason": "That code has reached its usage limit."}
+            if c.execute("SELECT 1 FROM redeem_claims WHERE code=? AND user_id=?", (code, int(user_id))).fetchone():
+                return {"ok": False, "reason": "You already redeemed that code."}
+            c.execute("INSERT INTO redeem_claims(code, user_id, claimed_at) VALUES(?,?,?)", (code, int(user_id), _now()))
+            c.execute("UPDATE redeem_codes SET used_count=used_count+1 WHERE code=?", (code,))
+            try:
+                rewards = json.loads(row["rewards"] or "[]")
+            except json.JSONDecodeError:
+                rewards = []
+        applied = []
+        for reward in rewards:
+            kind = str(reward.get("kind", "")).lower()
+            qty = max(1, int(reward.get("qty", 1) or 1))
+            asset_id = str(reward.get("id", "") or "")
+            if kind in CURRENCY_COLUMNS:
+                self.add_currency(user_id, kind, qty)
+            elif kind == "exp":
+                self.add_exp(user_id, qty)
+            elif kind == "item" and asset_id in data.ITEMS:
+                self.add_item(user_id, asset_id, qty)
+            elif kind == "character" and asset_id in data.CHARACTERS:
+                self.add_character(user_id, asset_id, level=1, stars=1)
+            elif kind == "pet" and asset_id in data.PETS:
+                self.add_pet(user_id, asset_id)
+            elif kind == "gear" and asset_id in data.GEAR:
+                self.grant_gear(user_id, asset_id, qty)
+            elif kind == "shard" and asset_id in data.CHARACTERS:
+                self.add_shards(user_id, asset_id, qty)
+            elif kind == "title" and asset_id in data.TITLES:
+                self.set_field(user_id, "title", asset_id)
+            else:
+                continue
+            applied.append({"kind": kind, "id": asset_id, "qty": qty})
+        return {"ok": True, "code": code, "rewards": applied}
 
     def player(self, user_id: int) -> dict | None:
         with self.conn() as c:
@@ -1124,8 +1235,9 @@ class Database:
         row = c.execute("SELECT value FROM counters WHERE user_id=? AND key=? AND period_key='total'", (int(user_id), metric)).fetchone()
         return int(row["value"]) if row else 0
 
-    def _grant_rewards_tx(self, c: sqlite3.Connection, user_id: int, rewards: dict) -> None:
-        multiplier = random.randint(config.REWARD_SCALE_MIN, config.REWARD_SCALE_MAX)
+    def _grant_rewards_tx(self, c: sqlite3.Connection, user_id: int, rewards: dict, scale: tuple[int, int] | None = None) -> None:
+        low, high = scale or (config.REWARD_SCALE_MIN, config.REWARD_SCALE_MAX)
+        multiplier = random.randint(int(low), int(high))
         for key, value in rewards.items():
             value = int(value) * multiplier
             if key in ("yens", "gems", "crystals", "tickets"):
@@ -1611,9 +1723,9 @@ class Database:
             ).fetchall()
         return _rows_to_dicts(rows)
 
-    def grant_rewards(self, user_id: int, rewards: dict) -> None:
+    def grant_rewards(self, user_id: int, rewards: dict, scale: tuple[int, int] | None = None) -> None:
         with self.conn() as c:
-            self._grant_rewards_tx(c, user_id, rewards)
+            self._grant_rewards_tx(c, user_id, rewards, scale)
 
     def market_listings(self, limit: int = 10, offset: int = 0) -> list[dict]:
         with self.conn() as c:
@@ -1712,6 +1824,26 @@ class Database:
                 c.execute("INSERT INTO gear(user_id, gear_id, level, acquired_at) VALUES(?,?,?,?)", (int(user_id), meta.get("gear_key", row["item_id"]), int(meta.get("level", 1)), _now()))
             c.execute("DELETE FROM market WHERE id=?", (int(listing_id),))
         return {"ok": True, "name": row["item_id"], "kind": row["kind"]}
+
+    def leaderboard_wealth(self, limit: int = 5) -> dict[str, list[dict]]:
+        columns = ("yens", "gems", "crystals")
+        result: dict[str, list[dict]] = {}
+        with self.conn() as c:
+            for column in columns:
+                rows = c.execute(
+                    f"SELECT user_id, username, first_name, level, rank, {column} AS amount FROM players "
+                    f"WHERE banned=0 ORDER BY {column} DESC, level DESC LIMIT ?",
+                    (int(limit),),
+                ).fetchall()
+                result[column] = _rows_to_dicts(rows)
+            rows = c.execute(
+                "SELECT p.user_id, p.username, p.first_name, p.level, p.rank, COUNT(c.char_id) AS amount "
+                "FROM players p LEFT JOIN characters c ON c.user_id=p.user_id "
+                "WHERE p.banned=0 GROUP BY p.user_id ORDER BY amount DESC, p.level DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            result["characters"] = _rows_to_dicts(rows)
+        return result
 
     def leaderboard_players(self, limit: int = 10, order: str = "level") -> list[dict]:
         allowed = {

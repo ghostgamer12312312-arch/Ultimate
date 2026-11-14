@@ -69,12 +69,12 @@ ELEMENTS = {
 RARITY_ORDER = ["common", "rare", "epic", "legendary", "mythic", "divine"]
 RARITY_INDEX = {rarity: index for index, rarity in enumerate(RARITY_ORDER)}
 RARITIES = {
-    "common": {"name": "Common", "emoji": "⚪", "weight": 440, "mult": 1.00, "sell": 80, "gem_dup": 5},
-    "rare": {"name": "Rare", "emoji": "🔵", "weight": 300, "mult": 1.12, "sell": 240, "gem_dup": 10},
-    "epic": {"name": "Epic", "emoji": "🟣", "weight": 160, "mult": 1.28, "sell": 650, "gem_dup": 20},
-    "legendary": {"name": "Legendary", "emoji": "🟡", "weight": 75, "mult": 1.48, "sell": 1800, "gem_dup": 40},
-    "mythic": {"name": "Mythic", "emoji": "🔴", "weight": 22, "mult": 1.72, "sell": 5000, "gem_dup": 80},
-    "divine": {"name": "Divine", "emoji": "🟠", "weight": 3, "mult": 2.05, "sell": 14000, "gem_dup": 160},
+    "common": {"name": "Common", "emoji": "⚪", "weight": 565, "mult": 1.00, "sell": 80, "gem_dup": 5},
+    "rare": {"name": "Rare", "emoji": "🔵", "weight": 270, "mult": 1.12, "sell": 240, "gem_dup": 10},
+    "epic": {"name": "Epic", "emoji": "🟣", "weight": 118, "mult": 1.28, "sell": 650, "gem_dup": 20},
+    "legendary": {"name": "Legendary", "emoji": "🟡", "weight": 37, "mult": 1.48, "sell": 1800, "gem_dup": 40},
+    "mythic": {"name": "Mythic", "emoji": "🔴", "weight": 8, "mult": 1.72, "sell": 5000, "gem_dup": 80},
+    "divine": {"name": "Divine", "emoji": "🟠", "weight": 2, "mult": 2.05, "sell": 14000, "gem_dup": 160},
 }
 
 RANKS = [
@@ -125,10 +125,10 @@ def upgrade_rarity(rarity: str, steps: int = 1) -> str:
 def _stats(power: int, rarity: str, scale: float = 1.0) -> dict:
     mult = RARITIES[rarity]["mult"] * scale
     return {
-        "hp": int((650 + power * 34 + RARITY_INDEX[rarity] * 190) * mult),
-        "atk": int((42 + power * 7 + RARITY_INDEX[rarity] * 14) * mult),
-        "def": int((26 + power * 5 + RARITY_INDEX[rarity] * 11) * mult),
-        "spd": int((18 + power * 1.7 + RARITY_INDEX[rarity] * 3) * mult),
+        "hp": int((520 + power * 24 + RARITY_INDEX[rarity] * 140) * mult),
+        "atk": int((32 + power * 5 + RARITY_INDEX[rarity] * 10) * mult),
+        "def": int((20 + power * 3.5 + RARITY_INDEX[rarity] * 8) * mult),
+        "spd": int((14 + power * 1.3 + RARITY_INDEX[rarity] * 2.2) * mult),
     }
 
 
@@ -1011,6 +1011,35 @@ for _series, _entries in EXTRA_SKILLS.items():
         SERIES_SKILL_IDS[_series].append(_sid)
 
 SKILLS_BY_SERIES = {series: list(ids) for series, ids in SERIES_SKILL_IDS.items()}
+
+
+# Give every active technique a concrete gameplay effect instead of only raw damage.
+for _index, _skill_data in enumerate(SKILLS.values()):
+    if _skill_data.get("type") != "active" or _skill_data.get("bonus"):
+        continue
+    _text = f"{_skill_data.get('id', '')} {_skill_data.get('name', '')} {_skill_data.get('description', '')}".lower()
+    _bonus: dict[str, float | int] = {"atk_pct": 0.04, "crit": 0.01}
+    if any(word in _text for word in ("phoenix", "heal", "regen", "restore", "recover", "life")):
+        _bonus["heal_hp"] = 26
+        _bonus["heal_hp_min"] = 20
+        _bonus["heal_hp_max"] = 32
+        _bonus["hp_pct"] = 0.02
+    if any(word in _text for word in ("barrier", "shield", "guard", "wall", "aegis", "fortress", "defense", "armor")):
+        _bonus["def_pct"] = 0.06
+        _bonus["hp_flat"] = 40
+    if any(word in _text for word in ("luck", "fate", "fortune", "almighty", "dice", "gamble")):
+        _bonus["crit"] = 0.035
+        _bonus["drop_rate"] = 0.03
+        _bonus["gacha_luck"] = 0.02
+    if any(word in _text for word in ("greed", "gold", "treasure", "plunder", "loot", "gluttony", "predator")):
+        _bonus["drop_rate"] = round(float(_bonus.get("drop_rate", 0.0)) + 0.06, 3)
+    if any(word in _text for word in ("summon", "pull", "banner", "wish", "almighty")):
+        _bonus["gacha_luck"] = round(float(_bonus.get("gacha_luck", 0.0)) + 0.04, 3)
+    if any(word in _text for word in ("speed", "swift", "flash", "transmission", "motion", "rush")):
+        _bonus["spd_pct"] = 0.05
+    if _index % 3 == 0:
+        _bonus["hp_flat"] = int(_bonus.get("hp_flat", 0)) + 40
+    _skill_data["bonus"] = _bonus
 
 EXTRA_GEAR = {
     "dragonball": [
