@@ -386,7 +386,7 @@ async def cmd_userid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     elif query:
         target = db.find_player(query)
         if target is None:
-            await respond(update, "❌ No player found with that ID or username.")
+            await respond(update, "❌ No player found with that ID or username.\nUsage: /userid @username — or reply to their message with /userid.")
             return
     else:
         user = update.effective_user
@@ -3650,6 +3650,10 @@ HANDLERS = {
     "about": cmd_about,
     "myid": cmd_myid,
     "userid": cmd_userid,
+    "user_id": cmd_userid,
+    "uid": cmd_userid,
+    "getid": cmd_userid,
+    "whois": cmd_userid,
     "id": cmd_userid,
     "register": cmd_register,
     "profile": cmd_profile,
