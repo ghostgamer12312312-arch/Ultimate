@@ -83,6 +83,11 @@ CREATE TABLE IF NOT EXISTS players (
     weapon TEXT,
     armor TEXT,
     accessory TEXT,
+    helmet TEXT,
+    shoes TEXT,
+    pants TEXT,
+    clothes TEXT,
+    robe TEXT,
     title TEXT NOT NULL DEFAULT 'title_rookie',
     avatar TEXT NOT NULL DEFAULT 'rookie',
     clan_id INTEGER,
@@ -198,6 +203,7 @@ CREATE TABLE IF NOT EXISTS clans (
     treasury_gems INTEGER NOT NULL DEFAULT 0,
     treasury_crystals INTEGER NOT NULL DEFAULT 0,
     announcement TEXT NOT NULL DEFAULT '',
+    group_link TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 
@@ -376,7 +382,8 @@ PLAYER_COLUMNS = {
     "username", "first_name", "series", "rank", "level", "exp", "yens", "gems",
     "crystals", "tickets", "stamina", "max_stamina", "stamina_updated", "hp",
     "current_hp", "atk", "def", "spd", "skill_points", "equipped_char", "team",
-    "weapon", "armor", "accessory", "title", "avatar", "clan_id", "daily_day",
+    "weapon", "armor", "accessory", "helmet", "shoes", "pants", "clothes", "robe",
+    "title", "avatar", "clan_id", "daily_day",
     "daily_streak", "weekly_week", "monthly_month", "npc_streak", "best_streak",
     "boss_kills", "gacha_pulls", "pity", "pet_pity", "starter_claimed", "raid_damage", "total_battles", "wins",
     "losses", "pvp_wins", "arena_rating", "clan_donation", "market_sales",
@@ -469,6 +476,11 @@ class Database:
                 "weapon": "TEXT",
                 "armor": "TEXT",
                 "accessory": "TEXT",
+                "helmet": "TEXT",
+                "shoes": "TEXT",
+                "pants": "TEXT",
+                "clothes": "TEXT",
+                "robe": "TEXT",
                 "title": "TEXT NOT NULL DEFAULT 'title_rookie'",
                 "avatar": "TEXT NOT NULL DEFAULT 'rookie'",
                 "clan_id": "INTEGER",
@@ -498,6 +510,7 @@ class Database:
                 "description": "TEXT NOT NULL DEFAULT ''",
                 "open_join": "INTEGER NOT NULL DEFAULT 1",
                 "min_level": "INTEGER NOT NULL DEFAULT 1",
+                "group_link": "TEXT NOT NULL DEFAULT ''",
             },
         }
         for table, columns in migrations.items():
@@ -1089,7 +1102,7 @@ class Database:
         if item is None:
             return {"ok": False, "reason": "Gear not found."}
         slot = item["slot"]
-        column = {"weapon": "weapon", "armor": "armor", "accessory": "accessory"}.get(slot)
+        column = slot if slot in data.GEAR_SLOTS else None
         if column is None:
             return {"ok": False, "reason": "Unknown gear slot."}
         with self.conn() as c:
@@ -1099,7 +1112,7 @@ class Database:
         return {"ok": True, "slot": slot, "item": item}
 
     def unequip_gear(self, user_id: int, slot: str) -> bool:
-        column = {"weapon": "weapon", "armor": "armor", "accessory": "accessory"}.get(slot)
+        column = slot if slot in data.GEAR_SLOTS else None
         if column is None:
             return False
         with self.conn() as c:
@@ -1557,6 +1570,20 @@ class Database:
         with self.conn() as c:
             c.execute("UPDATE clans SET description=? WHERE id=?", (text, int(clan["id"])))
         return {"ok": True, "text": text}
+
+    def clan_set_group_link(self, actor_id: int, link: str) -> dict:
+        clan = self.clan(actor_id)
+        member = self.clan_member(actor_id)
+        if clan is None or member is None or member["role"] != "leader":
+            return {"ok": False, "reason": "Only the clan leader can edit the group link."}
+        link = link.strip()
+        if link and not link.startswith(("http://", "https://")):
+            return {"ok": False, "reason": "Group link must start with http:// or https://."}
+        if len(link) > 250:
+            return {"ok": False, "reason": "Group link is too long (max 250 characters)."}
+        with self.conn() as c:
+            c.execute("UPDATE clans SET group_link=? WHERE id=?", (link, int(clan["id"])))
+        return {"ok": True, "link": link}
 
     def clan_settings(self, actor_id: int, open_join: bool | None = None, min_level: int | None = None) -> dict:
         clan = self.clan(actor_id)
@@ -2019,7 +2046,7 @@ class Database:
             if row is None:
                 raise ValueError("Gear not found.")
             c.execute("UPDATE gear SET user_id=?, equipped_slot=NULL WHERE id=?", (target_id, instance_id))
-            for slot in ("weapon", "armor", "accessory"):
+            for slot in data.GEAR_SLOTS:
                 c.execute(f"UPDATE players SET {slot}=NULL WHERE user_id=? AND {slot}=?", (source_id, instance_id))
             base = data.GEAR.get(row["gear_id"], {})
             return {"kind": kind, "id": instance_id, "qty": 1, "label": f"{base.get('name', row['gear_id'])} Lv.{row['level']}"}

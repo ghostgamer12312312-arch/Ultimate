@@ -89,7 +89,7 @@ def effective_stats(db, user_id: int, main_id: str | None = None) -> dict:
         main = next((characters[cid] for cid in team_ids if cid in characters), None)
         support = [characters[cid] for cid in team_ids[1:] if cid in characters]
 
-    gear_slot_ids = [player.get("weapon"), player.get("armor"), player.get("accessory")]
+    gear_slot_ids = [player.get(slot) for slot in data.GEAR_SLOTS]
     gear_items = []
     for instance_id in gear_slot_ids:
         if instance_id:
@@ -848,6 +848,8 @@ def shop_catalog(category: str = "all") -> list[dict]:
         entries.append({"id": item_id, "name": item["name"], "emoji": item["emoji"], "price": item["price"], "currency": item["currency"], "kind": "item", "desc": item["desc"]})
     if category in ("all", "gear"):
         for gear_id, gear in data.GEAR.items():
+            if gear.get("pull_only"):
+                continue
             entries.append({"id": gear_id, "name": gear["name"], "emoji": data.RARITIES[gear["rarity"]]["emoji"], "price": gear["price"], "currency": gear["currency"], "kind": "gear", "desc": gear["desc"]})
     return entries
 

@@ -15,7 +15,7 @@ from pathlib import Path
 from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 try:
     from . import battle, config, data, game, ui
@@ -309,13 +309,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "📖 <b>COMMAND GUIDE</b>\n\n"
         "<b>⚔️ Combat & Progression</b>\n"
-        "/hunt [series] — preview an NPC, then Battle or Flee\n/npc [series] — view NPC zones\n"
+        "/hunt [series] — preview an NPC, then Battle or Flee\n/flee — escape any active battle\n/npc [series] — view NPC zones\n"
         "/boss [series] — choose a persistent series boss\n/elite — elite hunt\n/streak — NPC streak\n"
         "/raid or /global — world boss info\n/attack — attack the world boss\n"
         "/summonboss [series|boss_id] — summon and damage a persistent boss\n"
         "/clanraid [start|attack|info] — clan raid\n/arena — random PvP duel\n/duel &lt;id|@user&gt; — challenge a player\n\n"
         "<b>🎴 Heroes & Summoning</b>\n"
-        "/gacha — banners by series\n/pull &lt;series|multiverse&gt; [10]\n/summon — alias for pull\n/wish [series] — use 7 Dragon Balls\n/starter — one-time starter hero and rewards\n/redeem &lt;code&gt; — claim a redeem code\n"
+        "/gacha — hero summon banners by series\n/pull [series] [10] — equipment gacha (800+ weapons, armor, helmets, shoes, pants, clothes, robes)\n/summon — browse hero banners\n/wish [series] — use 7 Dragon Balls\n/starter — one-time starter hero and rewards\n/redeem &lt;code&gt; — claim a redeem code\n"
         "/characters [series] [rarity] [page]\n/character &lt;name/id&gt;\n/team &lt;id1&gt; &lt;id2&gt; &lt;id3&gt;\n"
         "/equipchar &lt;id&gt; • /levelup &lt;id&gt; [n]\n/awaken &lt;id&gt; • /fuse &lt;id&gt;\n"
         "/skills • /learn &lt;skill_id&gt; • /skill_equip &lt;skill_id&gt;\n"
@@ -332,6 +332,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/clan_info • /clan_donate &lt;yens|gems|crystals&gt; &lt;amount&gt;\n"
         "/clan_kick &lt;user&gt; • /clan_promote &lt;user&gt; • /clan_demote &lt;user&gt;\n"
         "/clan_announce &lt;text&gt; • /clan_disband\n"
+        "/clan treasury • /clan members • /clan manage — description, group link, image\n"
         "/clan_invite &lt;user&gt; • /clan_add &lt;user&gt; • /clan_accept • /clan_transfer &lt;user&gt;\n"
         "/clan desc &lt;text&gt; • /clan open on|off • /clan minlevel &lt;level&gt;\n"
         "/clanraid_start &lt;raid_id&gt; • /clanraid_attack\n"
@@ -1100,7 +1101,7 @@ async def cmd_unequip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     player = await guard(update, context)
     if player is None or not context.args:
         if player:
-            await respond(update, "Usage: /unequip &lt;weapon|armor|accessory&gt;")
+            await respond(update, "Usage: /unequip &lt;weapon|armor|accessory|helmet|shoes|pants|clothes|robe&gt;")
         return
     db = get_db(context)
     if db.unequip_gear(update.effective_user.id, context.args[0].lower()):
@@ -1121,7 +1122,7 @@ async def gacha_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for banner in data.GACHA_BANNERS.values():
         featured = ", ".join(ui.esc(data.CHARACTERS[cid]["name"]) for cid in banner["featured"][:3] if cid in data.CHARACTERS)
         lines.append(f"{banner['emoji']} <b>{ui.esc(banner['name'])}</b>\n   Featured: {featured or 'Mixed pool'}")
-    lines.append("\nTap a banner or use /pull &lt;series&gt; [10].")
+    lines.append("\nTap a banner to summon heroes. Equipment gacha is /pull.")
     await respond(update, "\n".join(lines), ui.gacha_keyboard())
 
 
@@ -1179,17 +1180,114 @@ async def do_pull(update: Update, context: ContextTypes.DEFAULT_TYPE, series: st
         card = result["results"][0]["character"]
 
 
-async def cmd_pull(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    series = parse_series(context.args[0]) if context.args else "multiverse"
-    count = 10 if len(context.args) > 1 and context.args[1].lower() in ("10", "x10", "multi") else 1
-    if not context.args:
-        await gacha_view(update, context)
+def equipment_pull_keyboard(series: str | None, count: int) -> InlineKeyboardMarkup:
+    key = series or "all"
+    rows = [[
+        InlineKeyboardButton("🎁 Pull Again x1", callback_data=f"eqpull:{key}:1"),
+        InlineKeyboardButton("🎁 Pull Again x10", callback_data=f"eqpull:{key}:10"),
+    ], [
+        InlineKeyboardButton("🎒 Inventory", callback_data="menu:inventory"),
+        InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main"),
+    ]]
+    return InlineKeyboardMarkup(rows)
+
+
+async def equipment_pull_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
         return
-    await do_pull(update, context, series or context.args[0], count)
+    total = sum(len(ids) for ids in data.PULL_GEAR_BY_SERIES.values())
+    lines = [
+        "🎁 <b>EQUIPMENT PULL</b>",
+        f"💠 Yens: <b>{ui.fmt(player['yens'])}</b> • 📦 Pull-only gear: <b>{total}</b>",
+        "",
+        f"Single: <b>{ui.fmt(config.EQUIP_PULL_COST_YENS)}</b> yens • 10x: <b>{ui.fmt(config.EQUIP_PULL_MULTI_COST_YENS)}</b> yens",
+        "Each series has 20 pieces in every category:",
+        "⚔️ Weapons • 🛡️ Armor • 🔮 Gear • 🪖 Helmets",
+        "👟 Shoes • 👖 Pants • 👕 Clothes • 🥋 Robes",
+        "",
+        "<b>Series:</b> Dragon Ball, Naruto, Bleach, Jujutsu Kaisen, Tempest",
+        "Use <code>/pull [series] [10]</code> or tap a button below.",
+        "New slots can be equipped from /inventory.",
+    ]
+    rows = []
+    for series in data.SERIES_ORDER:
+        info = data.SERIES[series]
+        rows.append([
+            InlineKeyboardButton(f"{info['emoji']} {info['short']} x1", callback_data=f"eqpull:{series}:1"),
+            InlineKeyboardButton(f"{info['emoji']} {info['short']} x10", callback_data=f"eqpull:{series}:10"),
+        ])
+    rows.append([
+        InlineKeyboardButton("🌌 All Series x1", callback_data="eqpull:all:1"),
+        InlineKeyboardButton("🌌 All Series x10", callback_data="eqpull:all:10"),
+    ])
+    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def do_equipment_pull(update: Update, context: ContextTypes.DEFAULT_TYPE, series: str | None, count: int) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    user_id = update.effective_user.id
+    count = 10 if int(count) >= 10 else 1
+    chosen_series = parse_series(series) if series and series != "all" else None
+    if series and series != "all" and chosen_series is None:
+        await respond(update, "❌ Unknown series. Use /pull to see the available series.")
+        return
+    cost = config.EQUIP_PULL_MULTI_COST_YENS if count == 10 else config.EQUIP_PULL_COST_YENS
+    if not db.spend(user_id, yens=cost):
+        await respond(update, f"❌ Not enough yens. You need {ui.fmt(cost)}.")
+        return
+    series_pool = [chosen_series] if chosen_series else list(data.SERIES_ORDER)
+    results = []
+    for _ in range(count):
+        picked_series = random.choice(series_pool)
+        pool = data.PULL_GEAR_BY_SERIES[picked_series]
+        weights = [max(1, int(data.RARITIES[data.GEAR[gear_id]["rarity"]]["weight"])) for gear_id in pool]
+        gear_id = random.choices(pool, weights=weights, k=1)[0]
+        gear = data.GEAR[gear_id]
+        instance_id = db.grant_gear(user_id, gear_id)
+        results.append((gear, instance_id))
+    title = "ALL SERIES" if chosen_series is None else data.SERIES[chosen_series]["name"]
+    lines = [
+        f"🎁 <b>EQUIPMENT PULL ×{count}</b>",
+        f"🌍 {ui.esc(title)} • 💠 -{ui.fmt(cost)} yens",
+        "",
+    ]
+    for gear, instance_id in results:
+        rarity = data.RARITIES[gear["rarity"]]
+        series_info = data.SERIES[gear["series"]]
+        lines.append(
+            f"{rarity['emoji']} <b>{ui.esc(gear['name'])}</b> — {rarity['name']}\n"
+            f"   {series_info['emoji']} {ui.esc(series_info['short'])} • {ui.esc(gear.get('category_name', gear['slot']))} • "
+            f"Power {gear['power']} • <code>#{instance_id}</code>"
+        )
+    lines.extend(["", "Equip new gear from /inventory."])
+    await respond(update, "\n".join(lines), equipment_pull_keyboard(chosen_series, count))
+
+
+async def cmd_pull(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await equipment_pull_view(update, context)
+        return
+    series = None
+    count = 1
+    for arg in context.args:
+        value = arg.strip().lower()
+        if value in ("10", "x10", "multi"):
+            count = 10
+        elif parse_series(arg):
+            series = parse_series(arg)
+        elif value not in ("all", "multiverse"):
+            await respond(update, "❌ Usage: /pull [series] [10]")
+            return
+    await do_equipment_pull(update, context, series or "all", count)
 
 
 async def cmd_summon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await cmd_pull(update, context)
+    await gacha_view(update, context)
 
 
 async def cmd_wish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1362,11 +1460,11 @@ async def cmd_enhance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     player = await guard(update, context)
     if player is None or not context.args:
         if player:
-            await respond(update, "Usage: /enhance &lt;weapon|armor|accessory|gear_instance_id&gt;")
+            await respond(update, "Usage: /enhance &lt;slot|gear_instance_id&gt;")
         return
     db = get_db(context)
     value = context.args[0].lower()
-    if value in ("weapon", "armor", "accessory"):
+    if value in data.GEAR_SLOTS:
         field = player.get(value)
         if not field:
             await respond(update, "❌ No gear equipped in that slot.")
@@ -1705,6 +1803,10 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await leaderboard_view(update, context, category)
 
 
+def clan_art_key(clan: dict) -> str:
+    return str(clan.get("tag") or clan["id"]).lower()
+
+
 async def clan_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     player = await guard(update, context)
     if player is None:
@@ -1725,34 +1827,211 @@ async def clan_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await respond(update, "Clan data unavailable.")
         return
     members = info["members"]
+    art = db.art_get("clan", clan_art_key(clan))
     lines = [
         f"🏯 <b>{ui.esc(info['name'])}</b> [{ui.esc(info['tag'])}]",
         f"Level {info['level']} • EXP {ui.fmt(info['exp'])} • {len(members)}/30 members",
         f"💰 Treasury: 💠 {ui.fmt(info['treasury_yens'])} • 💎 {ui.fmt(info['treasury_gems'])} • 🔮 {ui.fmt(info['treasury_crystals'])}",
         f"📢 {ui.esc(info['announcement'] or 'No announcement.')}",
         f"📝 {ui.esc(info.get('description') or 'No description yet.')}",
+        f"🔗 Group: {('<code>' + ui.esc(info.get('group_link')) + '</code>') if info.get('group_link') else 'Not set'}",
+        f"🖼️ Clan image: {'Uploaded' if art else 'Not set'}",
         f"⚙️ Join: {'Open' if info.get('open_join', 1) else 'Invite only'} • Min level {info.get('min_level', 1)}",
         "",
-        "👥 <b>Members</b>",
+        "Choose an option below to view treasury, members, raids, or manage the clan.",
     ]
-    for member in members[:15]:
-        name = member.get("first_name") or member.get("username") or "Summoner"
-        lines.append(f"• {ui.esc(name)} — {member['role'].title()} • Lv.{member['level']} • {ui.fmt(member['donation'])} donated")
-    lines.extend([
+    rows = [
+        [InlineKeyboardButton("💰 Treasury", callback_data="clan:treasury"), InlineKeyboardButton("👥 Members", callback_data="clan:members")],
+        [InlineKeyboardButton("🏯 Clan Raid", callback_data="menu:clanraid"), InlineKeyboardButton("⚙️ Manage", callback_data="clan:manage")],
+        [InlineKeyboardButton("🏆 Top Clans", callback_data="lb:clans"), InlineKeyboardButton("🚪 Leave Clan", callback_data="clan:leave_request")],
+    ]
+    if art:
+        rows.append([InlineKeyboardButton("🖼️ View Clan Image", callback_data="clan:image:view")])
+    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def clan_treasury_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    clan = db.clan(update.effective_user.id)
+    member = db.clan_member(update.effective_user.id)
+    if clan is None or member is None:
+        await respond(update, "❌ You are not in a clan.", ui.back_keyboard("menu:clan"))
+        return
+    info = db.clan_info(clan["id"])
+    lines = [
+        f"💰 <b>CLAN TREASURY — {ui.esc(clan['name'])}</b>",
         "",
-        "Commands: /clan_info /clan_donate /clanraid /clan_leave",
-        "Leaders: /clan_kick /clan_promote /clan_demote /clan_announce /clan_disband",
-        "Manage: /clan invite &lt;user&gt; • /clan add &lt;user&gt; • /clan accept • /clan transfer &lt;user&gt;",
-        "Settings: /clan desc &lt;text&gt; • /clan open on|off • /clan minlevel &lt;level&gt;",
-    ])
+        f"💠 Yens: <b>{ui.fmt(info['treasury_yens'])}</b>",
+        f"💎 Gems: <b>{ui.fmt(info['treasury_gems'])}</b>",
+        f"🔮 Crystals: <b>{ui.fmt(info['treasury_crystals'])}</b>",
+        f"🏅 Clan level: <b>{info['level']}</b> • EXP: <b>{ui.fmt(info['exp'])}</b>",
+        f"🎁 Your total donation: <b>{ui.fmt(member.get('donation', 0))}</b>",
+        "",
+        "Donations fund clan progression and raids.",
+    ]
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏯 Clan Raid", callback_data="menu:clanraid"), InlineKeyboardButton("🏆 Top Clans", callback_data="lb:clans")],
-        [InlineKeyboardButton("💠 Donate 100", callback_data="clan:donate:100"), InlineKeyboardButton("💠 Donate 1,000", callback_data="clan:donate:1000"), InlineKeyboardButton("💠 Donate 10,000", callback_data="clan:donate:10000")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="clan:settings"), InlineKeyboardButton("🚪 Leave Clan", callback_data="clan:leave_request")],
-        [InlineKeyboardButton("🖼️ Clan Card", callback_data="menu:clanpic"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+        [InlineKeyboardButton("💠 Donate 1,000", callback_data="clan:donate:yens:1000"), InlineKeyboardButton("💠 Donate 10,000", callback_data="clan:donate:yens:10000")],
+        [InlineKeyboardButton("💎 Donate 100", callback_data="clan:donate:gems:100"), InlineKeyboardButton("🔮 Donate 10", callback_data="clan:donate:crystals:10")],
+        [InlineKeyboardButton("⬅️ Clan", callback_data="menu:clan")],
     ])
     await respond(update, "\n".join(lines), keyboard)
-    leader_name = next((m.get("first_name") or m.get("username") or str(m["user_id"]) for m in members if m["role"] == "leader"), "")
+
+
+async def clan_members_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    clan = db.clan(update.effective_user.id)
+    if clan is None:
+        await respond(update, "❌ You are not in a clan.", ui.back_keyboard("menu:clan"))
+        return
+    info = db.clan_info(clan["id"])
+    members = info.get("members", [])
+    lines = [f"👥 <b>CLAN MEMBERS — {ui.esc(clan['name'])}</b>", f"{len(members)}/30 members", ""]
+    for index, member in enumerate(members[:30], 1):
+        name = member.get("first_name") or member.get("username") or "Summoner"
+        role_icon = {"leader": "👑", "officer": "⭐", "member": "👤"}.get(member.get("role"), "👤")
+        joined = str(member.get("joined_at") or "")[:10]
+        lines.append(
+            f"{index}. {role_icon} <b>{ui.esc(name)}</b> — {ui.esc(str(member.get('role', 'member')).title())}\n"
+            f"   Lv.{member.get('level', 1)} • Arena {ui.fmt(member.get('arena_rating', 0))} • "
+            f"Donated {ui.fmt(member.get('donation', 0))} • {ui.esc(joined)}"
+        )
+    rows = [[InlineKeyboardButton("⚙️ Manage", callback_data="clan:manage"), InlineKeyboardButton("💰 Treasury", callback_data="clan:treasury")]]
+    rows.append([InlineKeyboardButton("⬅️ Clan", callback_data="menu:clan")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def clan_manage_view(update: Update, context: ContextTypes.DEFAULT_TYPE, note: str = "") -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    clan = db.clan(update.effective_user.id)
+    member = db.clan_member(update.effective_user.id)
+    if clan is None or member is None:
+        await respond(update, "❌ You are not in a clan.", ui.back_keyboard("menu:clan"))
+        return
+    if member.get("role") != "leader":
+        await respond(update, "❌ Only the clan leader can manage the clan.", ui.back_keyboard("menu:clan"))
+        return
+    info = db.clan_info(clan["id"])
+    art = db.art_get("clan", clan_art_key(clan))
+    lines = [
+        f"⚙️ <b>MANAGE CLAN — {ui.esc(clan['name'])}</b>",
+        "",
+        f"📝 Description: {ui.esc(info.get('description') or 'Not set')}",
+        f"🔗 Group link: {ui.esc(info.get('group_link') or 'Not set')}",
+        f"🖼️ Clan image: {'Uploaded' if art else 'Not set'}",
+        "",
+        "Choose what to edit. You can also use /clan desc &lt;text&gt; and /clan link &lt;url&gt;.",
+    ]
+    if note:
+        lines.extend(["", note])
+    rows = [
+        [InlineKeyboardButton("📝 Add/Edit Description", callback_data="clan:manage:description")],
+        [InlineKeyboardButton("🔗 Add/Edit Group Link", callback_data="clan:manage:group_link")],
+        [InlineKeyboardButton("🖼️ Add/Edit Clan Image", callback_data="clan:manage:image")],
+    ]
+    if art:
+        rows.append([InlineKeyboardButton("🔍 View Clan Image", callback_data="clan:image:view")])
+    rows.append([InlineKeyboardButton("⬅️ Clan", callback_data="menu:clan")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def clan_manage_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    member = db.clan_member(update.effective_user.id)
+    if member is None or member.get("role") != "leader":
+        await respond(update, "❌ Only the clan leader can manage the clan.", ui.back_keyboard("menu:clan"))
+        return
+    getattr(context, "user_data", {})["clan_manage"] = field
+    if field == "description":
+        text = "📝 <b>New description</b>\n\nSend the new clan description as your next message (max 200 characters).\nCancel with /clan manage."
+    elif field == "group_link":
+        text = "🔗 <b>New group link</b>\n\nSend the group link as your next message. It must start with http:// or https://.\nCancel with /clan manage."
+    else:
+        text = "🖼️ <b>New clan image</b>\n\nSend or forward the image as a photo (or send an https:// image URL) as your next message.\nCancel with /clan manage."
+    await respond(update, text, ui.back_keyboard("menu:clan"))
+
+
+async def handle_clan_manage_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    field = getattr(context, "user_data", {}).get("clan_manage")
+    if not field:
+        return
+    message = update.effective_message
+    if message is None or update.effective_user is None:
+        return
+    db = get_db(context)
+    clan = db.clan(update.effective_user.id)
+    member = db.clan_member(update.effective_user.id)
+    if clan is None or member is None or member.get("role") != "leader":
+        getattr(context, "user_data", {}).pop("clan_manage", None)
+        await respond(update, "❌ Only the clan leader can manage the clan.", ui.back_keyboard("menu:clan"))
+        return
+    if field == "image":
+        file_id = None
+        photo = getattr(message, "photo", None)
+        document = getattr(message, "document", None)
+        if photo:
+            file_id = photo[-1].file_id
+        elif document and (document.mime_type or "").startswith("image/"):
+            file_id = document.file_id
+        elif message.text and message.text.strip().startswith(("http://", "https://")):
+            file_id = message.text.strip()
+        if not file_id:
+            await respond(update, "🖼️ Send a photo, an image file, or an https:// image URL. Cancel with /clan manage.")
+            return
+        db.art_set("clan", clan_art_key(clan), clan["name"], file_id, update.effective_user.id)
+        getattr(context, "user_data", {}).pop("clan_manage", None)
+        await clan_manage_view(update, context, "✅ Clan image updated.")
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await respond(update, "Please send text, or cancel with /clan manage.")
+        return
+    if field == "description":
+        result = db.clan_set_description(update.effective_user.id, text)
+        ok_text = "✅ Clan description updated."
+    else:
+        result = db.clan_set_group_link(update.effective_user.id, text)
+        ok_text = "✅ Clan group link updated."
+    if not result.get("ok"):
+        await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not update the clan.'))}")
+        return
+    getattr(context, "user_data", {}).pop("clan_manage", None)
+    await clan_manage_view(update, context, ok_text)
+
+
+async def clan_image_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    clan = db.clan(update.effective_user.id)
+    if clan is None:
+        await respond(update, "❌ You are not in a clan.", ui.back_keyboard("menu:clan"))
+        return
+    art = db.art_get("clan", clan_art_key(clan))
+    if not art:
+        await respond(update, "🖼️ This clan has no image yet. Leaders can add one from /clan → Manage.", ui.back_keyboard("menu:clan"))
+        return
+    try:
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=art["file_id"],
+            caption=f"🏯 {clan['name']} [{clan['tag']}]",
+        )
+    except TelegramError as exc:
+        await respond(update, f"❌ Could not send the clan image: {ui.esc(str(exc))}", ui.back_keyboard("menu:clan"))
 
 
 async def clan_leave_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1852,6 +2131,20 @@ async def cmd_clan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if sub in ("desc", "description"):
         result = db.clan_set_description(update.effective_user.id, " ".join(rest))
         await respond(update, "📝 Clan description updated." if result["ok"] else f"❌ {ui.esc(result['reason'])}")
+        return
+    if sub in ("link", "grouplink", "group_link"):
+        result = db.clan_set_group_link(update.effective_user.id, " ".join(rest))
+        await respond(update, "🔗 Clan group link updated." if result["ok"] else f"❌ {ui.esc(result['reason'])}")
+        return
+    if sub == "manage":
+        getattr(context, "user_data", {}).pop("clan_manage", None)
+        await clan_manage_view(update, context)
+        return
+    if sub == "treasury":
+        await clan_treasury_view(update, context)
+        return
+    if sub in ("members", "member"):
+        await clan_members_view(update, context)
         return
     if sub == "open":
         value = (rest[0].lower() if rest else "").strip()
@@ -3302,6 +3595,22 @@ async def cmd_element(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await respond(update, "\n".join(lines), ui.back_keyboard())
 
 
+async def cmd_flee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    active = db.active_battle(update.effective_user.id)
+    if active is None:
+        await respond(update, "🏃 You are not in a battle.", ui.back_keyboard())
+        return
+    result = battle.act(db, update.effective_user.id, active["battle_id"], "flee")
+    if not result.get("ok"):
+        await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not flee.'))}", ui.back_keyboard())
+        return
+    await show_battle(update, context, result["battle"])
+
+
 async def cmd_unstuck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     player = await guard(update, context)
     if player is None:
@@ -3559,8 +3868,8 @@ COMMANDS: list[tuple[str, str]] = [
     ("use", "Use an item"),
     ("equip", "Equip gear"),
     ("unequip", "Unequip gear"),
-    ("gacha", "Summon banners"),
-    ("pull", "Summon heroes"),
+    ("gacha", "Summon heroes and banners"),
+    ("pull", "Equipment gacha: 800+ weapons and armor"),
     ("summonboss", "Fight a persistent summon boss"),
     ("wish", "Use 7 Dragon Balls"),
     ("shop", "Browse the shop"),
@@ -3682,6 +3991,8 @@ HANDLERS = {
     "gacha": cmd_gacha,
     "pull": cmd_pull,
     "summon": cmd_summon,
+    "flee": cmd_flee,
+    "escape": cmd_flee,
     "summonboss": cmd_summonboss,
     "summonattack": cmd_summonattack,
     "wish": cmd_wish,
@@ -3909,6 +4220,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         count = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
         await do_pull(update, context, series, count)
         return
+    if key == "eqpull":
+        series = parts[1] if len(parts) > 1 else "all"
+        count = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        await do_equipment_pull(update, context, series, count)
+        return
     if key == "shop":
         action = parts[1] if len(parts) > 1 else "all"
         if action == "item" and len(parts) > 2:
@@ -4078,6 +4394,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         db = get_db(context)
         action = parts[1] if len(parts) > 1 else ""
+        if not (action == "manage" and len(parts) > 2):
+            getattr(context, "user_data", {}).pop("clan_manage", None)
         if action == "leave_request":
             await clan_leave_request(update, context)
             return
@@ -4115,12 +4433,36 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             result = db.clan_transfer(update.effective_user.id, parts[2])
             await respond(update, "👑 Leadership transferred." if result["ok"] else f"❌ {ui.esc(result['reason'])}", ui.back_keyboard("menu:clan"))
             return
-        if action == "donate" and len(parts) > 2 and parts[2].isdigit():
-            result = db.clan_donate(update.effective_user.id, "yens", int(parts[2]))
-            await respond(update, f"✅ Donated {ui.fmt(result['amount'])} yens." if result["ok"] else f"❌ {ui.esc(result['reason'])}", ui.back_keyboard("menu:clan"))
+        if action == "donate" and len(parts) > 2:
+            currency = "yens"
+            if parts[2] in ("yens", "gems", "crystals") and len(parts) > 3:
+                currency, amount_text = parts[2], parts[3]
+            else:
+                amount_text = parts[2]
+            if not amount_text.isdigit():
+                await respond(update, "❌ Invalid donation amount.", ui.back_keyboard("clan:treasury"))
+                return
+            result = db.clan_donate(update.effective_user.id, currency, int(amount_text))
+            await respond(update, f"✅ Donated {ui.fmt(result['amount'])} {currency}." if result["ok"] else f"❌ {ui.esc(result['reason'])}", ui.back_keyboard("clan:treasury"))
+            return
+        if action == "treasury":
+            await clan_treasury_view(update, context)
+            return
+        if action in ("members", "member"):
+            await clan_members_view(update, context)
+            return
+        if action == "manage" and len(parts) > 2:
+            await clan_manage_prompt(update, context, parts[2])
+            return
+        if action == "manage":
+            getattr(context, "user_data", {}).pop("clan_manage", None)
+            await clan_manage_view(update, context)
+            return
+        if action == "image" and len(parts) > 2 and parts[2] == "view":
+            await clan_image_view(update, context)
             return
         if action == "settings":
-            await respond(update, "⚙️ <b>Clan Settings</b>\n\n/clan desc &lt;text&gt;\n/clan open on|off\n/clan minlevel &lt;level&gt;\n/clan announce &lt;text&gt;\n/clan invite &lt;user&gt;\n/clan kick &lt;user&gt;\n/clan promote &lt;user&gt;\n/clan demote &lt;user&gt;", ui.back_keyboard("menu:clan"))
+            await respond(update, "⚙️ <b>Clan Settings</b>\n\n/clan desc &lt;text&gt;\n/clan link &lt;url&gt;\n/clan open on|off\n/clan minlevel &lt;level&gt;\n/clan announce &lt;text&gt;\n/clan invite &lt;user&gt;\n/clan kick &lt;user&gt;\n/clan promote &lt;user&gt;\n/clan demote &lt;user&gt;", ui.back_keyboard("menu:clan"))
             return
     if key == "world" and len(parts) > 1 and parts[1] == "attack":
         await cmd_attack(update, context)
@@ -4290,6 +4632,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         action = parts[1] if len(parts) > 1 else ""
         if action == "flee":
+            active = get_db(context).active_battle(update.effective_user.id)
+            if active is not None:
+                result = battle.act(get_db(context), update.effective_user.id, active["battle_id"], "flee")
+                if result.get("ok"):
+                    await show_battle(update, context, result["battle"])
+                    return
             await respond(update, "🏃 You left the boss hunt. No stamina was used.", ui.main_menu_keyboard())
             return
         if action == "view" and len(parts) > 2:
@@ -4308,6 +4656,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         action = parts[1] if len(parts) > 1 else ""
         if action == "flee":
+            active = get_db(context).active_battle(update.effective_user.id)
+            if active is not None:
+                result = battle.act(get_db(context), update.effective_user.id, active["battle_id"], "flee")
+                if result.get("ok"):
+                    await show_battle(update, context, result["battle"])
+                    return
             await respond(update, "🏃 You fled from the encounter. No stamina was used.", ui.main_menu_keyboard())
             return
         if action == "reroll" and len(parts) > 2:
@@ -4435,6 +4789,14 @@ def build_application() -> Application:
     for name, handler in HANDLERS.items():
         application.add_handler(CommandHandler(name, timed_handler(name, handler)))
     application.add_handler(CallbackQueryHandler(timed_handler("callback", callback_router)))
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        timed_handler("clan_manage_text", handle_clan_manage_input),
+    ))
+    application.add_handler(MessageHandler(
+        filters.PHOTO | filters.Document.IMAGE,
+        timed_handler("clan_manage_image", handle_clan_manage_input),
+    ))
     application.add_error_handler(error_handler)
     return application
 

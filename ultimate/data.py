@@ -1099,6 +1099,87 @@ for _series, _templates in EXTRA_GEAR.items():
 for _gear in GEAR.values():
     _gear.setdefault("rank", _gear["rarity"].title())
 
+GEAR_SLOTS = ("weapon", "armor", "accessory", "helmet", "shoes", "pants", "clothes", "robe")
+
+PULL_CATEGORIES: dict[str, tuple[str, str, list[str]]] = {
+    "weapon": ("weapon", "Weapon", [
+        "Blade", "Sword", "Spear", "Staff", "Scythe", "Bow", "Gauntlet", "Warhammer", "Katana", "Lance",
+        "Dagger", "Axe", "Halberd", "Chakram", "Whip", "Claw", "Orb", "Fan", "Trident", "Greatsword",
+    ]),
+    "armor": ("armor", "Armor", [
+        "Vest", "Cuirass", "Breastplate", "Guard", "Mail", "Plate", "Carapace", "Aegis", "Battlecoat", "Harness",
+        "Shell", "Brigandine", "Hauberk", "Mantle", "Bulwark", "Ward", "Scale", "Bastion", "Fortress", "Warlate",
+    ]),
+    "gear": ("accessory", "Gear", [
+        "Charm", "Ring", "Amulet", "Pendant", "Talisman", "Bracer", "Emblem", "Sigil", "Relic", "Badge",
+        "Token", "Idol", "Locket", "Crest", "Band", "Focus", "Seal", "Core", "Artifact", "Soulstone",
+    ]),
+    "helmet": ("helmet", "Helmet", [
+        "Helm", "Headgear", "Hood", "Mask", "Crown", "Casque", "Visor", "Circlet", "Cap", "Coif",
+        "Barbute", "Sallet", "Diadem", "Warhelm", "Kabuto", "Halo", "Crest", "Greathelm", "Faceguard", "Cowl",
+    ]),
+    "shoes": ("shoes", "Shoes", [
+        "Boots", "Greaves", "Sandals", "Sneakers", "Treads", "Striders", "Footguards", "Sabatons", "War Boots", "Runners",
+        "Walkers", "Spurs", "Galoshes", "Clogs", "Talons", "Cleats", "Soles", "Stompers", "Footwraps", "Warboots",
+    ]),
+    "pants": ("pants", "Pants", [
+        "Pants", "Trousers", "Leggings", "Greaves", "Breeches", "Slacks", "Cuisses", "Chausses", "Kilt", "Hakama",
+        "Tassets", "Legwraps", "Jodhpurs", "Pantaloons", "Shin Guards", "Thighguards", "Cargos", "Bottoms", "Legguards", "Legplates",
+    ]),
+    "clothes": ("clothes", "Clothes", [
+        "Gi", "Tunic", "Shirt", "Coat", "Jacket", "Cloak", "Uniform", "Vestment", "Wrap", "Garb",
+        "Attire", "Bodysuit", "Jerkin", "Doublet", "Habit", "Raiment", "Garments", "Battlewear", "Regalia", "Outfit",
+    ]),
+    "robe": ("robe", "Robe", [
+        "Robe", "Mantle", "Cloak", "Cape", "Shawl", "Vestment", "Cassock", "Surcoat", "Kaftan", "Habit",
+        "Stole", "Poncho", "Drape", "Overcoat", "Shroud", "Vesture", "Raiment", "Wraps", "Gown", "Wardrobe",
+    ]),
+}
+
+PULL_SERIES_ADJECTIVES = {
+    "dragonball": "Saiyan", "naruto": "Shinobi", "bleach": "Reiatsu",
+    "jujutsu": "Cursed", "tempest": "Tempest",
+}
+PULL_PREFIXES = [
+    "Initiate's", "Iron", "Reinforced", "Battle", "Tempered", "Elite", "Chakra", "Spirit", "Shadow", "Ancient",
+    "Royal", "Sacred", "Cursed", "Celestial", "Abyssal", "Divine", "Eternal", "Mythic", "Transcendent", "Ultimate",
+]
+PULL_GEAR_BY_SERIES: dict[str, list[str]] = {series: [] for series in SERIES_ORDER}
+PULL_GEAR_BY_CATEGORY: dict[str, list[str]] = {category: [] for category in PULL_CATEGORIES}
+
+for _series in SERIES_ORDER:
+    _adj = PULL_SERIES_ADJECTIVES[_series]
+    _short = SERIES[_series]["short"].lower()
+    for _category, (_slot, _label, _nouns) in PULL_CATEGORIES.items():
+        for _index in range(20):
+            _power = 38 + round(_index * 62 / 19)
+            _rarity = rarity_for_power(_power)
+            _base = _stats(_power, _rarity, 0.34)
+            _name = f"{_adj} {PULL_PREFIXES[_index]} {_nouns[_index]}"
+            _gear_id = f"gear_pull_{_short}_{_category}_{_index + 1:02d}"
+            GEAR[_gear_id] = {
+                "id": _gear_id,
+                "name": _name,
+                "series": _series,
+                "slot": _slot,
+                "category": _category,
+                "category_name": _label,
+                "element": ELEMENT_ORDER[(_index + len(_category)) % len(ELEMENT_ORDER)],
+                "rarity": _rarity,
+                "rank": _rarity.title(),
+                "power": _power,
+                "price": max(1, _power * 55),
+                "currency": "crystals" if _power >= 88 else "yens",
+                "hp": _base["hp"],
+                "atk": _base["atk"],
+                "def": _base["def"],
+                "spd": _base["spd"],
+                "desc": f"Pull-only {_label.lower()} from {SERIES[_series]['name']}.",
+                "pull_only": True,
+            }
+            PULL_GEAR_BY_SERIES[_series].append(_gear_id)
+            PULL_GEAR_BY_CATEGORY[_category].append(_gear_id)
+
 EXTRA_ITEMS = {
     "rank_common_core": {"name": "Common Rank Core", "emoji": "⚪", "kind": "material", "value": 1, "price": 80, "currency": "yens", "rank": "Common", "desc": "Rank-up material for basic gear."},
     "rank_rare_core": {"name": "Rare Rank Core", "emoji": "🔵", "kind": "material", "value": 1, "price": 220, "currency": "yens", "rank": "Rare", "desc": "Rank-up material for rare gear."},
@@ -1130,7 +1211,10 @@ STARTER_CHARACTER_POOL = {
     for series in SERIES_ORDER
 }
 STARTER_GEAR_POOL = {
-    slot: [gid for gid, gear in GEAR.items() if gear["slot"] == slot and gear["rarity"] in ("common", "rare")]
+    slot: [
+        gid for gid, gear in GEAR.items()
+        if gear["slot"] == slot and gear["rarity"] in ("common", "rare") and not gear.get("pull_only")
+    ]
     for slot in ("weapon", "armor", "accessory")
 }
 
