@@ -2148,6 +2148,123 @@ class Database:
             return {"ok": True, "message": f"Granted the ultimate bundle to {target_id}."}
         return {"ok": False, "reason": "Unknown asset type."}
 
+    def remove_asset(self, target_id: int, kind: str, asset_id, qty: int = 1) -> dict:
+        kind = str(kind).lower().strip()
+        aliases = {
+            "money": "yens", "gacha_ticket": "tickets", "gacha_tickets": "tickets",
+            "sp": "skill_points", "char": "character", "companions": "pet",
+            "companion": "pet", "shards": "shard", "items": "item",
+        }
+        kind = aliases.get(kind, kind)
+        target_id = int(target_id)
+        player = self.player(target_id)
+        if player is None:
+            return {"ok": False, "reason": "Player not found."}
+        qty = max(1, int(qty))
+        if kind in ("yens", "gems", "crystals", "tickets", "stamina", "skill_points"):
+            amount = int(asset_id if str(asset_id).lstrip("-").isdigit() else qty)
+            if amount <= 0:
+                return {"ok": False, "reason": "Amount must be positive."}
+            removed = min(int(player.get(kind, 0)), amount)
+            if removed:
+                self.add_currency(target_id, kind, -removed)
+            return {"ok": True, "removed": removed, "message": f"Removed {removed:,} {kind}."}
+        if kind == "exp":
+            amount = int(asset_id if str(asset_id).lstrip("-").isdigit() else qty)
+            if amount <= 0:
+                return {"ok": False, "reason": "Amount must be positive."}
+            removed = min(int(player.get("exp", 0)), amount)
+            self.set_field(target_id, "exp", int(player.get("exp", 0)) - removed)
+            return {"ok": True, "removed": removed, "message": f"Removed {removed:,} EXP."}
+        if kind == "character":
+            char_id = str(asset_id)
+            if char_id not in data.CHARACTERS:
+                return {"ok": False, "reason": "Unknown character."}
+            with self.conn() as c:
+                row = c.execute("SELECT id FROM characters WHERE user_id=? AND char_id=?", (target_id, char_id)).fetchone()
+                if row is None:
+                    return {"ok": False, "reason": "Player does not own that character."}
+                c.execute("DELETE FROM characters WHERE user_id=? AND char_id=?", (target_id, char_id))
+                c.execute("DELETE FROM character_shards WHERE user_id=? AND char_id=?", (target_id, char_id))
+                current = c.execute("SELECT team, equipped_char FROM players WHERE user_id=?", (target_id,)).fetchone()
+                if current:
+                    try:
+                        team = json.loads(current["team"] or "[]")
+                    except (TypeError, ValueError):
+                        team = []
+                    team = [cid for cid in team if cid != char_id]
+                    equipped = team[0] if team else None
+                    if current["equipped_char"] == char_id:
+                        c.execute("UPDATE players SET team=?, equipped_char=? WHERE user_id=?", (json.dumps(team), equipped, target_id))
+                    else:
+                        c.execute("UPDATE players SET team=? WHERE user_id=?", (json.dumps(team), target_id))
+            return {"ok": True, "removed": 1, "message": f"Removed {data.CHARACTERS[char_id]['name']}."}
+        if kind == "gear":
+            token = str(asset_id)
+            with self.conn() as c:
+                rows = []
+                if token.isdigit():
+                    row = c.execute("SELECT id, gear_id, level FROM gear WHERE user_id=? AND id=?", (target_id, int(token))).fetchone()
+                    if row:
+                        rows = [row]
+                if not rows:
+                    rows = c.execute("SELECT id, gear_id, level FROM gear WHERE user_id=? AND gear_id=? LIMIT ?", (target_id, token, qty)).fetchall()
+                if not rows:
+                    return {"ok": False, "reason": "Gear not found."}
+                for row in rows:
+                    c.execute("DELETE FROM gear WHERE user_id=? AND id=?", (target_id, int(row["id"])))
+                    for slot in data.GEAR_SLOTS:
+                        c.execute(f"UPDATE players SET {slot}=NULL WHERE user_id=? AND {slot}=?", (target_id, int(row["id"])))
+            first = data.GEAR.get(rows[0]["gear_id"], {})
+            name = first.get("name", rows[0]["gear_id"])
+            suffix = f" x{len(rows)}" if len(rows) > 1 else f" Lv.{rows[0]['level']}"
+            return {"ok": True, "removed": len(rows), "message": f"Removed {name}{suffix}."}
+        if kind == "item":
+            item_id = str(asset_id)
+            if item_id not in data.ITEMS:
+                return {"ok": False, "reason": "Unknown item."}
+            with self.conn() as c:
+                row = c.execute("SELECT qty FROM items WHERE user_id=? AND item_id=?", (target_id, item_id)).fetchone()
+                if row is None or int(row["qty"]) <= 0:
+                    return {"ok": False, "reason": "Player does not own that item."}
+                removed = min(int(row["qty"]), qty)
+                if int(row["qty"]) - removed <= 0:
+                    c.execute("DELETE FROM items WHERE user_id=? AND item_id=?", (target_id, item_id))
+                else:
+                    c.execute("UPDATE items SET qty=qty-? WHERE user_id=? AND item_id=?", (removed, target_id, item_id))
+            return {"ok": True, "removed": removed, "message": f"Removed {data.ITEMS[item_id]['name']} x{removed}."}
+        if kind == "pet":
+            pet_id = str(asset_id)
+            if pet_id not in data.PETS:
+                return {"ok": False, "reason": "Unknown companion."}
+            with self.conn() as c:
+                row = c.execute("SELECT equipped FROM pets WHERE user_id=? AND pet_id=?", (target_id, pet_id)).fetchone()
+                if row is None:
+                    return {"ok": False, "reason": "Player does not own that companion."}
+                c.execute("DELETE FROM pets WHERE user_id=? AND pet_id=?", (target_id, pet_id))
+                if row["equipped"]:
+                    replacement = c.execute("SELECT pet_id FROM pets WHERE user_id=? ORDER BY level DESC LIMIT 1", (target_id,)).fetchone()
+                    if replacement:
+                        c.execute("UPDATE pets SET equipped=1 WHERE user_id=? AND pet_id=?", (target_id, replacement["pet_id"]))
+            return {"ok": True, "removed": 1, "message": f"Removed {data.PETS[pet_id]['name']}."}
+        if kind == "shard":
+            char_id = str(asset_id)
+            if char_id not in data.CHARACTERS:
+                return {"ok": False, "reason": "Unknown character."}
+            current = self.shards(target_id, char_id)
+            if current <= 0:
+                return {"ok": False, "reason": "Player has no shards for that character."}
+            removed = min(current, qty)
+            self.take_shards(target_id, char_id, removed)
+            return {"ok": True, "removed": removed, "message": f"Removed {removed} shards for {data.CHARACTERS[char_id]['name']}."}
+        if kind == "title":
+            title_id = str(asset_id)
+            if title_id not in data.TITLES:
+                return {"ok": False, "reason": "Unknown title."}
+            self.set_field(target_id, "title", "")
+            return {"ok": True, "removed": 1, "message": f"Removed title {data.TITLES[title_id]['name']}."}
+        return {"ok": False, "reason": "Unsupported removal type."}
+
     def trade_create(self, initiator_id: int, target_id: int) -> dict:
         initiator_id, target_id = int(initiator_id), int(target_id)
         if initiator_id == target_id:

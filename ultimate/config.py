@@ -35,7 +35,7 @@ BACKUP_DIR: str = (
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
 
 GAME_NAME = "Dragon Ball: Multiverse Legends"
-GAME_VERSION = "2.0.0"
+GAME_VERSION = "2.1.0"
 DEFAULT_SERIES = "dragonball"
 
 GACHA_COST_TICKET = 1
