@@ -69,7 +69,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton("📖 Story", callback_data="menu:chapters"), InlineKeyboardButton("🌌 Summon Boss", callback_data="menu:summonboss")],
         [InlineKeyboardButton("📜 Quests", callback_data="menu:quests"), InlineKeyboardButton("🏆 Rankings", callback_data="menu:leaderboard")],
         [InlineKeyboardButton("🎯 Pity", callback_data="menu:pity"), InlineKeyboardButton("🌀 Elements", callback_data="menu:element")],
-        [InlineKeyboardButton("👑 Crown Art", callback_data="menu:crown"), InlineKeyboardButton("🧹 Unstuck", callback_data="menu:unstuck")],
+        [InlineKeyboardButton("🧹 Unstuck", callback_data="menu:unstuck")],
         [InlineKeyboardButton("📖 Help", callback_data="menu:help")],
     ])
 
@@ -111,7 +111,7 @@ def banner_keyboard(series: str):
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎟️ Summon x1", callback_data=f"pull:{series}:1"), InlineKeyboardButton("🎟️ Summon x10", callback_data=f"pull:{series}:10")],
-        [InlineKeyboardButton("🎴 All Banners", callback_data="menu:gacha"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+        [InlineKeyboardButton("🎴 All Banners", callback_data="menu:gacha")],
     ])
 
 
@@ -122,7 +122,6 @@ def shop_keyboard():
         [InlineKeyboardButton("🗂️ All Items", callback_data="shop:all"), InlineKeyboardButton("🧪 Potions", callback_data="shop:potions")],
         [InlineKeyboardButton("🎟️ Summon", callback_data="shop:summon"), InlineKeyboardButton("🧰 Materials", callback_data="shop:materials")],
         [InlineKeyboardButton("⚙️ Gear", callback_data="shop:gear"), InlineKeyboardButton("🌅 Daily Shop", callback_data="shop:daily")],
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ])
 
 

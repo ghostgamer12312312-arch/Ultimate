@@ -24,6 +24,7 @@ def _parse_admin_ids(raw: str | None) -> tuple[int, ...]:
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS: tuple[int, ...] = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
+OWNER_IDS: tuple[int, ...] = ADMIN_IDS
 DB_PATH: str = (
     os.getenv("ULTIMATE_DB_PATH", "").strip()
     or str(BASE_DIR / "ultimate.db")
@@ -33,6 +34,18 @@ BACKUP_DIR: str = (
     or str(BASE_DIR / "backups" / "ultimate")
 )
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+
+
+def _parse_chat_id(raw: str | None):
+    value = (raw or "").strip()
+    if not value:
+        return None
+    if value.lstrip("-").isdigit():
+        return int(value)
+    return value
+
+
+QUERY_GROUP_ID = _parse_chat_id(os.getenv("QUERY_GROUP_ID") or os.getenv("QUERY_ADMIN_GC"))
 
 GAME_NAME = "Dragon Ball: Multiverse Legends"
 GAME_VERSION = "2.1.0"
@@ -51,10 +64,10 @@ STAMINA_REGEN_SECONDS = 240
 CLAN_CREATE_YENS = 2500
 CLAN_CREATE_CRYSTALS = 50
 MAX_TEAM = 3
-REWARD_SCALE_MIN = 3
-REWARD_SCALE_MAX = 7
+REWARD_SCALE_MIN = 1
+REWARD_SCALE_MAX = 1
 BATTLE_REWARD_SCALE_MIN = 1
-BATTLE_REWARD_SCALE_MAX = 2
+BATTLE_REWARD_SCALE_MAX = 1
 PET_SUMMON_COSTS = {1: 1000, 10: 10000, 50: 50000}
 PET_SUMMON_PITY = 100
 TRADE_MAX_OFFERS = 20

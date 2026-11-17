@@ -33,9 +33,9 @@ def _passive_bonus(skill_ids: list[str], scale: float = 1.0) -> dict:
 def scaled_character(character: dict) -> dict:
     level = int(character.get("level", 1))
     stars = int(character.get("stars", 1))
-    level_mult = 1.0 + 0.060 * (level - 1)
-    star_mult = 1.0 + 0.10 * (stars - 1)
-    awaken_mult = 1.06 if character.get("awakened") else 1.0
+    level_mult = 1.0 + 0.032 * (level - 1)
+    star_mult = 1.0 + 0.065 * (stars - 1)
+    awaken_mult = 1.04 if character.get("awakened") else 1.0
     mult = level_mult * star_mult * awaken_mult
     return {
         "hp": int(character["hp"] * mult),
@@ -54,10 +54,10 @@ def effective_stats(db, user_id: int, main_id: str | None = None) -> dict:
     player = db.require_player(user_id)
     rank = data.rank_for_level(int(player["level"]))
     base = {
-        "hp": 700 + int(player["level"]) * 115,
-        "atk": 55 + int(player["level"]) * 11,
-        "def": 28 + int(player["level"]) * 7,
-        "spd": 20 + int(player["level"]) * 1.6,
+        "hp": 420 + int(player["level"]) * 48,
+        "atk": 34 + int(player["level"]) * 4.8,
+        "def": 20 + int(player["level"]) * 3.2,
+        "spd": 16 + int(player["level"]) * 0.75,
     }
     for key in base:
         base[key] *= rank["bonus"]
@@ -329,7 +329,7 @@ def choose_skill(attacker: dict, turn: int, rng: random.Random) -> dict | None:
 def attack_damage(attacker: dict, defender: dict, skill: dict | None, rng: random.Random) -> tuple[int, bool, bool]:
     if rng.random() < float(defender.get("dodge", 0.0)):
         return 0, False, True
-    multiplier = float(skill["power"]) if skill else 1.0
+    multiplier = 1.0 + (float(skill["power"]) - 1.0) * 0.68 if skill else 1.0
     damage = max(1.0, float(attacker["atk"]) * multiplier - float(defender["def"]) * 0.44)
     damage *= element_multiplier(attacker.get("element", "spirit"), defender.get("element", "spirit"))
     crit = rng.random() < float(attacker.get("crit", 0.08))

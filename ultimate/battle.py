@@ -396,7 +396,7 @@ def start_clanraid(db, user_id: int) -> dict:
     return {"ok": True, "battle": _new_battle(db, user_id, "clanraid", f"🏯 Clan Raid — {info['name']}", enemy, meta, f"Your clan strikes {info['name']}!")}
 
 
-def start_duel(db, user_id: int, opponent_id: int, *, arena: bool = False) -> dict:
+def start_duel(db, user_id: int, opponent_id: int, *, arena: bool = False, duel_id: int | None = None) -> dict:
     battle = _resume(db, user_id)
     if battle:
         return {"ok": True, "battle": battle, "resumed": True}
@@ -414,6 +414,7 @@ def start_duel(db, user_id: int, opponent_id: int, *, arena: bool = False) -> di
     rating_change = random.randint(14, 25)
     meta = {
         "kind": "duel", "arena": arena, "opponent_id": int(opponent_id), "rating_change": rating_change,
+        "duel_id": int(duel_id) if duel_id else None,
         "win_field": "pvp_wins", "rewards": {"yens": 280, "exp": 180, "gems": 8},
         "loss_rewards": {"yens": 80, "exp": 45, "gems": 1},
     }
@@ -449,7 +450,7 @@ def start(db, user_id: int, mode: str, **kwargs) -> dict:
     if mode == "arena":
         return start_arena(db, user_id)
     if mode == "duel":
-        return start_duel(db, user_id, int(kwargs["opponent_id"]))
+        return start_duel(db, user_id, int(kwargs["opponent_id"]), arena=bool(kwargs.get("arena")), duel_id=kwargs.get("duel_id"))
     return {"ok": False, "reason": "Unknown battle mode."}
 
 
@@ -580,6 +581,9 @@ def _finish(db, user_id: int, battle: dict, outcome: str) -> dict:
     _grant(db, user_id, rewards, drops)
     if outcome != "fled":
         _record(db, user_id, battle, won)
+    if battle["mode"] == "duel" and meta.get("duel_id"):
+        winner_id = int(user_id) if outcome == "victory" else int(meta["opponent_id"])
+        state["duel_settlement"] = db.settle_duel(int(meta["duel_id"]), winner_id)
     state["status"] = "finished"
     state["outcome"] = outcome
     state["rewards"] = rewards
@@ -824,6 +828,16 @@ def render(battle: dict) -> str:
         if drops:
             names = [f"{data.ITEMS.get(key, {}).get('emoji', '📦')} {data.ITEMS.get(key, {}).get('name', key)} x{qty}" for key, qty in drops.items()]
             lines.append("Loot: " + ", ".join(names))
+        settlement = state.get("duel_settlement")
+        if settlement:
+            if settlement.get("ok"):
+                won_wager = int(settlement.get("winner_id", 0)) == int(battle.get("user_id", 0) or 0)
+                if settlement.get("labels"):
+                    lines.append(("🎁 Wager won: " if won_wager else "💸 Wager lost: ") + ", ".join(settlement["labels"]))
+                elif won_wager:
+                    lines.append("🎁 Wager won: no assets were staked.")
+            else:
+                lines.append(f"⚠️ Wager closed: {ui.esc(settlement.get('reason', 'settlement failed'))}")
     return "\n".join(lines)
 
 
@@ -834,7 +848,7 @@ def keyboard(battle: dict, potions: list[dict] | None = None):
     bid = battle["battle_id"]
     if state.get("status") == "finished":
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("👤 Profile", callback_data="menu:profile"), InlineKeyboardButton("🏠 Main Menu", callback_data="menu:main")],
+            [InlineKeyboardButton("👤 Profile", callback_data="menu:profile"), InlineKeyboardButton("⚔️ Duel Again", callback_data="menu:duel")],
         ])
     player = state["player"]
     rows = [[

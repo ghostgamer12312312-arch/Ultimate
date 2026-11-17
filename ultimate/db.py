@@ -253,6 +253,12 @@ CREATE TABLE IF NOT EXISTS world_boss_damage (
     PRIMARY KEY(cycle, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS admins (
+    user_id INTEGER PRIMARY KEY,
+    added_by INTEGER,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS market (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     seller_id INTEGER NOT NULL,
@@ -271,6 +277,21 @@ CREATE TABLE IF NOT EXISTS duel_logs (
     winner_id INTEGER,
     rating_change INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS duels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    challenger_id INTEGER NOT NULL,
+    opponent_id INTEGER NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'quick',
+    status TEXT NOT NULL DEFAULT 'pending',
+    challenger_stake TEXT NOT NULL DEFAULT '{}',
+    opponent_stake TEXT NOT NULL DEFAULT '{}',
+    challenger_ready INTEGER NOT NULL DEFAULT 0,
+    opponent_ready INTEGER NOT NULL DEFAULT 0,
+    winner_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS battle_logs (
@@ -350,6 +371,21 @@ CREATE TABLE IF NOT EXISTS custom_art (
     PRIMARY KEY(entity_type, entity_key)
 );
 
+CREATE TABLE IF NOT EXISTS queries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL DEFAULT 0,
+    username TEXT NOT NULL DEFAULT '',
+    display_name TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'bug',
+    query_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    admin_reply TEXT NOT NULL DEFAULT '',
+    handled_by INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS redeem_codes (
     code TEXT PRIMARY KEY,
     rewards TEXT NOT NULL,
@@ -376,6 +412,8 @@ CREATE INDEX IF NOT EXISTS idx_market_seller ON market(seller_id);
 CREATE INDEX IF NOT EXISTS idx_world_damage_cycle ON world_boss_damage(cycle);
 CREATE INDEX IF NOT EXISTS idx_trades_users ON trades(initiator_id, target_id, status);
 CREATE INDEX IF NOT EXISTS idx_chapter_user ON chapter_progress(user_id, series);
+CREATE INDEX IF NOT EXISTS idx_queries_status ON queries(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_queries_user ON queries(user_id);
 """
 
 PLAYER_COLUMNS = {
@@ -512,6 +550,14 @@ class Database:
                 "min_level": "INTEGER NOT NULL DEFAULT 1",
                 "group_link": "TEXT NOT NULL DEFAULT ''",
             },
+            "queries": {
+                "chat_id": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "clan_members": {
+                "withdraw_allowance": "INTEGER NOT NULL DEFAULT 0",
+                "withdrawn": "INTEGER NOT NULL DEFAULT 0",
+                "allowance_week": "TEXT NOT NULL DEFAULT ''",
+            },
         }
         for table, columns in migrations.items():
             existing = {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}
@@ -579,9 +625,9 @@ class Database:
         self.set_field(user_id, "equipped_char", starter)
         self.set_field(user_id, "team", json.dumps([starter]))
         bundle = {
-            "senzu_small": 12, "senzu_large": 4, "stamina_drink": 8,
-            "exp_scroll": 5, "exp_tome": 2, "gacha_ticket": 3,
-            "elite_key": 4, "boss_key": 5, "raid_token": 5,
+            "senzu_small": 6, "senzu_large": 2, "stamina_drink": 4,
+            "exp_scroll": 2, "exp_tome": 1, "gacha_ticket": 1,
+            "elite_key": 1, "boss_key": 2, "raid_token": 2,
             "awakening_stone": 2, "forge_core": 3, "crystal_shard": 5,
             "rank_common_core": 3, "rank_rare_core": 2,
             "weapon_scroll": 2, "armor_scroll": 2, "accessory_scroll": 2,
@@ -599,9 +645,9 @@ class Database:
             self.equip_gear(user_id, instance_id)
         if not self.pets(user_id):
             self.add_pet(user_id, data.STARTER_PET)
-        yens = random.randint(1000, 10000)
-        gems = random.randint(200, 800)
-        crystals = random.randint(10, 50)
+        yens = random.randint(500, 2500)
+        gems = random.randint(40, 120)
+        crystals = random.randint(5, 20)
         self.give(user_id, yens=yens, gems=gems, crystals=crystals)
         self.set_field(user_id, "starter_claimed", 1)
         return {
@@ -797,7 +843,7 @@ class Database:
 
     @staticmethod
     def exp_needed(level: int) -> int:
-        return 80 + int(level ** 1.65 * 28)
+        return 180 + int(level ** 2.18 * 62)
 
     def characters(self, user_id: int) -> list[dict]:
         with self.conn() as c:
@@ -1327,11 +1373,11 @@ class Database:
             return {"ok": False, "reason": "Daily reward already claimed today."}
         streak = int(player["daily_streak"]) + 1 if player["daily_day"] == (date.today() - timedelta(days=1)).isoformat() else 1
         rewards = {
-            "yens": 400 + min(streak, 7) * 150,
-            "gems": 10 + min(streak, 7) * 3,
-            "crystals": 2 + min(streak, 7),
+            "yens": 150 + min(streak, 7) * 55,
+            "gems": 4 + min(streak, 7),
+            "crystals": 1 + min(streak, 7) // 3,
             "tickets": 1 if streak % 7 == 0 else 0,
-            "exp": 100 + min(streak, 7) * 40,
+            "exp": 40 + min(streak, 7) * 15,
         }
         with self.conn() as c:
             c.execute("UPDATE players SET daily_day=?, daily_streak=? WHERE user_id=?", (today, streak, int(user_id)))
@@ -1343,7 +1389,7 @@ class Database:
         current = week_key()
         if player["weekly_week"] == current:
             return {"ok": False, "reason": "Weekly reward already claimed."}
-        rewards = {"yens": 3000, "gems": 70, "crystals": 20, "tickets": 2, "exp": 900}
+        rewards = {"yens": 1100, "gems": 24, "crystals": 7, "tickets": 1, "exp": 280}
         with self.conn() as c:
             c.execute("UPDATE players SET weekly_week=? WHERE user_id=?", (current, int(user_id)))
             self._grant_rewards_tx(c, user_id, rewards)
@@ -1354,7 +1400,7 @@ class Database:
         current = month_key()
         if player["monthly_month"] == current:
             return {"ok": False, "reason": "Monthly reward already claimed."}
-        rewards = {"yens": 12000, "gems": 250, "crystals": 80, "tickets": 6, "exp": 5000}
+        rewards = {"yens": 4000, "gems": 80, "crystals": 24, "tickets": 2, "exp": 1200}
         with self.conn() as c:
             c.execute("UPDATE players SET monthly_month=? WHERE user_id=?", (current, int(user_id)))
             self._grant_rewards_tx(c, user_id, rewards)
@@ -1669,6 +1715,51 @@ class Database:
         self.bump(user_id, "clan_donation", amount)
         return {"ok": True, "amount": amount, "currency": currency, "clan_exp": exp_gain}
 
+    def clan_set_allowance(self, actor_id: int, target_query: str, amount: int) -> dict:
+        clan = self.clan(actor_id)
+        actor = self.clan_member(actor_id)
+        if clan is None or actor is None or actor.get("role") != "leader":
+            return {"ok": False, "reason": "Only the clan leader can set withdrawal allowances."}
+        target = self.clan_member_target(int(clan["id"]), target_query)
+        if target is None:
+            return {"ok": False, "reason": "Member not found."}
+        amount = max(0, int(amount))
+        with self.conn() as c:
+            c.execute("UPDATE clan_members SET withdraw_allowance=?, allowance_week=? WHERE user_id=?", (amount, week_key(), int(target["user_id"])))
+        return {"ok": True, "member": target, "amount": amount}
+
+    def clan_withdraw(self, user_id: int, currency: str, amount: int) -> dict:
+        if currency not in ("yens", "gems", "crystals"):
+            return {"ok": False, "reason": "Withdraw yens, gems, or crystals."}
+        amount = int(amount)
+        if amount <= 0:
+            return {"ok": False, "reason": "Withdrawal must be positive."}
+        clan = self.clan(user_id)
+        member = self.clan_member(user_id)
+        if clan is None or member is None:
+            return {"ok": False, "reason": "Join a clan first."}
+        current_week = week_key()
+        withdrawn = int(member.get("withdrawn") or 0)
+        allowance = int(member.get("withdraw_allowance") or 0)
+        if member.get("allowance_week") != current_week:
+            withdrawn, allowance = 0, allowance
+            with self.conn() as c:
+                c.execute("UPDATE clan_members SET withdrawn=0, allowance_week=? WHERE user_id=?", (current_week, int(user_id)))
+        if member.get("role") != "leader":
+            if allowance <= 0:
+                return {"ok": False, "reason": "You do not have a withdrawal allowance. Ask the clan leader."}
+            if withdrawn + amount > allowance:
+                return {"ok": False, "reason": f"Weekly allowance exceeded. Used {withdrawn:,}/{allowance:,}."}
+        with self.conn() as c:
+            row = c.execute(f"SELECT treasury_{currency} FROM clans WHERE id=?", (int(clan["id"]),)).fetchone()
+            if row is None or int(row[f"treasury_{currency}"]) < amount:
+                return {"ok": False, "reason": "The clan treasury does not have enough."}
+            c.execute(f"UPDATE clans SET treasury_{currency}=treasury_{currency}-? WHERE id=?", (amount, int(clan["id"])))
+            c.execute(f"UPDATE players SET {currency}={currency}+? WHERE user_id=?", (amount, int(user_id)))
+            if member.get("role") != "leader":
+                c.execute("UPDATE clan_members SET withdrawn=withdrawn+?, allowance_week=? WHERE user_id=?", (amount, current_week, int(user_id)))
+        return {"ok": True, "amount": amount, "currency": currency, "member": self.clan_member(user_id) or member}
+
     def clan_announce(self, user_id: int, text: str) -> dict:
         clan = self.clan(user_id)
         member = self.clan_member(user_id)
@@ -1931,6 +2022,122 @@ class Database:
                 (int(challenger_id), int(opponent_id), winner_id, int(rating_change), _now()),
             )
 
+    @staticmethod
+    def _normalize_stake(stake: dict | None) -> dict:
+        stake = stake or {}
+        currency = {}
+        for key, value in (stake.get("currency") or {}).items():
+            if key in CURRENCY_COLUMNS and int(value or 0) > 0:
+                currency[key] = int(value)
+        return {
+            "currency": currency,
+            "characters": [str(x) for x in (stake.get("characters") or []) if str(x)],
+            "pets": [str(x) for x in (stake.get("pets") or []) if str(x)],
+            "gear": [int(x) for x in (stake.get("gear") or []) if str(x).isdigit()],
+        }
+
+    def create_duel(self, challenger_id: int, opponent_id: int, mode: str = "quick") -> int:
+        now = _now()
+        with self.conn() as c:
+            cursor = c.execute(
+                "INSERT INTO duels(challenger_id, opponent_id, mode, status, challenger_stake, opponent_stake, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (int(challenger_id), int(opponent_id), str(mode), "build" if mode == "wager" else "pending", "{}", "{}", now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def duel(self, duel_id: int) -> dict | None:
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM duels WHERE id=?", (int(duel_id),)).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["challenger_stake"] = self._normalize_stake(json.loads(item.get("challenger_stake") or "{}"))
+        item["opponent_stake"] = self._normalize_stake(json.loads(item.get("opponent_stake") or "{}"))
+        return item
+
+    def update_duel(self, duel_id: int, **fields) -> None:
+        allowed = {"mode", "status", "challenger_stake", "opponent_stake", "challenger_ready", "opponent_ready", "winner_id"}
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        for key in ("challenger_stake", "opponent_stake"):
+            if key in updates:
+                updates[key] = json.dumps(self._normalize_stake(updates[key]))
+        updates["updated_at"] = _now()
+        assignments = ", ".join(f"{key}=?" for key in updates)
+        with self.conn() as c:
+            c.execute(f"UPDATE duels SET {assignments} WHERE id=?", (*updates.values(), int(duel_id)))
+
+    def active_duel_between(self, first_id: int, second_id: int) -> dict | None:
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT id FROM duels WHERE status NOT IN ('done','cancelled','declined','failed') AND ((challenger_id=? AND opponent_id=?) OR (challenger_id=? AND opponent_id=?)) ORDER BY id DESC LIMIT 1",
+                (int(first_id), int(second_id), int(second_id), int(first_id)),
+            ).fetchone()
+        return self.duel(int(row["id"])) if row else None
+
+    def validate_stake(self, user_id: int, stake: dict) -> dict:
+        stake = self._normalize_stake(stake)
+        player = self.require_player(user_id)
+        for key, amount in stake["currency"].items():
+            if int(player.get(key, 0)) < int(amount):
+                return {"ok": False, "reason": f"Not enough {key} for this wager."}
+        with self.conn() as c:
+            for char_id in stake["characters"]:
+                if c.execute("SELECT 1 FROM characters WHERE user_id=? AND char_id=?", (int(user_id), char_id)).fetchone() is None:
+                    return {"ok": False, "reason": "One of the offered heroes is no longer available."}
+            for pet_id in stake["pets"]:
+                if c.execute("SELECT 1 FROM pets WHERE user_id=? AND pet_id=?", (int(user_id), pet_id)).fetchone() is None:
+                    return {"ok": False, "reason": "One of the offered companions is no longer available."}
+            for instance_id in stake["gear"]:
+                if c.execute("SELECT 1 FROM gear WHERE user_id=? AND id=?", (int(user_id), int(instance_id))).fetchone() is None:
+                    return {"ok": False, "reason": "One of the offered gear pieces is no longer available."}
+        return {"ok": True}
+
+    def validate_duel_stakes(self, duel_id: int) -> dict:
+        duel = self.duel(duel_id)
+        if duel is None:
+            return {"ok": False, "reason": "Duel not found."}
+        for owner, stake in ((int(duel["challenger_id"]), duel["challenger_stake"]), (int(duel["opponent_id"]), duel["opponent_stake"])):
+            check = self.validate_stake(owner, stake)
+            if not check["ok"]:
+                return check
+        return {"ok": True}
+
+    def settle_duel(self, duel_id: int, winner_id: int) -> dict:
+        duel = self.duel(duel_id)
+        if duel is None:
+            return {"ok": False, "reason": "Duel not found."}
+        if duel["status"] in ("done", "failed", "cancelled", "declined"):
+            return {"ok": False, "reason": "This wager was already closed."}
+        winner_id = int(winner_id)
+        challenger_id = int(duel["challenger_id"])
+        opponent_id = int(duel["opponent_id"])
+        if winner_id not in (challenger_id, opponent_id):
+            return {"ok": False, "reason": "Invalid duel winner."}
+        loser_id = opponent_id if winner_id == challenger_id else challenger_id
+        loser_stake = duel["opponent_stake"] if loser_id == opponent_id else duel["challenger_stake"]
+        labels = []
+        try:
+            with self.conn() as c:
+                for key, amount in loser_stake["currency"].items():
+                    moved = self._transfer_tx(c, loser_id, winner_id, key, int(amount), 1)
+                    labels.append(moved["label"])
+                for char_id in loser_stake["characters"]:
+                    moved = self._transfer_tx(c, loser_id, winner_id, "character", char_id, 1)
+                    labels.append(moved["label"])
+                for pet_id in loser_stake["pets"]:
+                    moved = self._transfer_tx(c, loser_id, winner_id, "pet", pet_id, 1)
+                    labels.append(moved["label"])
+                for instance_id in loser_stake["gear"]:
+                    moved = self._transfer_tx(c, loser_id, winner_id, "gear", int(instance_id), 1)
+                    labels.append(moved["label"])
+                c.execute("UPDATE duels SET status='done', winner_id=?, updated_at=? WHERE id=?", (winner_id, _now(), int(duel_id)))
+        except ValueError as exc:
+            self.update_duel(duel_id, status="failed")
+            return {"ok": False, "reason": str(exc)}
+        return {"ok": True, "winner_id": winner_id, "loser_id": loser_id, "labels": labels}
+
     def battle_record(self, user_id: int, enemy_name: str, result: str, damage: int = 0) -> None:
         with self.conn() as c:
             c.execute(
@@ -1949,6 +2156,37 @@ class Database:
         import random
         return dict(random.choice(rows))
 
+    def arena_candidates(self, user_id: int, limit: int = 5) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM players WHERE user_id<>? AND banned=0 AND equipped_char IS NOT NULL ORDER BY ABS(arena_rating - (SELECT arena_rating FROM players WHERE user_id=?)) LIMIT ?",
+                (int(user_id), int(user_id), int(limit)),
+            ).fetchall()
+        return _rows_to_dicts(rows)
+
+    def admins(self) -> list[int]:
+        with self.conn() as c:
+            rows = c.execute("SELECT user_id FROM admins ORDER BY created_at").fetchall()
+        return [int(row["user_id"]) for row in rows]
+
+    def is_dynamic_admin(self, user_id: int) -> bool:
+        with self.conn() as c:
+            return c.execute("SELECT 1 FROM admins WHERE user_id=?", (int(user_id),)).fetchone() is not None
+
+    def is_admin(self, user_id: int | None) -> bool:
+        if user_id is None:
+            return False
+        return config.is_admin(user_id) or self.is_dynamic_admin(int(user_id))
+
+    def add_admin(self, user_id: int, added_by: int) -> None:
+        with self.conn() as c:
+            c.execute("INSERT OR IGNORE INTO admins(user_id, added_by, created_at) VALUES(?,?,?)", (int(user_id), int(added_by), _now()))
+
+    def remove_admin(self, user_id: int) -> bool:
+        with self.conn() as c:
+            cursor = c.execute("DELETE FROM admins WHERE user_id=?", (int(user_id),))
+            return cursor.rowcount > 0
+
     def find_player(self, query: str) -> dict | None:
         query = str(query).strip().lstrip("@")
         with self.conn() as c:
@@ -1964,7 +2202,10 @@ class Database:
 
     def all_players(self, limit: int = 50) -> list[dict]:
         with self.conn() as c:
-            rows = c.execute("SELECT * FROM players ORDER BY last_seen DESC LIMIT ?", (int(limit),)).fetchall()
+            if int(limit) > 0:
+                rows = c.execute("SELECT * FROM players ORDER BY last_seen DESC LIMIT ?", (int(limit),)).fetchall()
+            else:
+                rows = c.execute("SELECT * FROM players ORDER BY last_seen DESC").fetchall()
         return _rows_to_dicts(rows)
 
     def admin_set(self, user_id: int, field: str, value) -> None:
@@ -2147,6 +2388,78 @@ class Database:
                     self.add_item(target_id, item_id, 99)
             return {"ok": True, "message": f"Granted the ultimate bundle to {target_id}."}
         return {"ok": False, "reason": "Unknown asset type."}
+
+    @staticmethod
+    def query_code(query_id: int) -> str:
+        return f"Q{int(query_id):04d}"
+
+    @staticmethod
+    def _parse_query_id(value) -> int | None:
+        text = str(value).strip().upper().lstrip("#")
+        if text.startswith("Q"):
+            text = text[1:]
+        return int(text) if text.isdigit() else None
+
+    def query_create(self, user_id: int, username: str, display_name: str, category: str, query_text: str, chat_id: int = 0) -> dict:
+        now = int(time.time())
+        with self.conn() as c:
+            cursor = c.execute(
+                "INSERT INTO queries(user_id, chat_id, username, display_name, category, query_text, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (int(user_id), int(chat_id or 0), username or "", display_name or "", category, query_text, now, now),
+            )
+            row = c.execute("SELECT * FROM queries WHERE id=?", (int(cursor.lastrowid),)).fetchone()
+        result = _row_to_dict(row) or {}
+        result["code"] = self.query_code(result.get("id", 0))
+        return result
+
+    def query_get(self, query_id) -> dict | None:
+        parsed = self._parse_query_id(query_id)
+        if parsed is None:
+            return None
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM queries WHERE id=?", (parsed,)).fetchone()
+        result = _row_to_dict(row)
+        if result:
+            result["code"] = self.query_code(result["id"])
+        return result
+
+    def queries(self, status: str | None = "open", limit: int = 50) -> list[dict]:
+        with self.conn() as c:
+            if status and status != "all":
+                rows = c.execute("SELECT * FROM queries WHERE status=? ORDER BY created_at DESC LIMIT ?", (status, int(limit))).fetchall()
+            else:
+                rows = c.execute("SELECT * FROM queries ORDER BY created_at DESC LIMIT ?", (int(limit),)).fetchall()
+        result = _rows_to_dicts(rows)
+        for row in result:
+            row["code"] = self.query_code(row["id"])
+        return result
+
+    def query_update(self, query_id, *, status: str | None = None, reply: str | None = None, handled_by: int | None = None) -> dict:
+        parsed = self._parse_query_id(query_id)
+        if parsed is None:
+            return {"ok": False, "reason": "Invalid query ID."}
+        ticket = self.query_get(parsed)
+        if ticket is None:
+            return {"ok": False, "reason": "Query not found."}
+        updates = {"updated_at": int(time.time())}
+        if status is not None:
+            updates["status"] = status
+        if reply is not None:
+            updates["admin_reply"] = reply
+        if handled_by is not None:
+            updates["handled_by"] = int(handled_by)
+        assignments = ", ".join(f"{key}=?" for key in updates)
+        with self.conn() as c:
+            c.execute(f"UPDATE queries SET {assignments} WHERE id=?", (*updates.values(), parsed))
+        updated = self.query_get(parsed) or ticket
+        return {"ok": True, "query": updated}
+
+    def query_stats(self) -> dict:
+        with self.conn() as c:
+            rows = c.execute("SELECT status, COUNT(*) AS n FROM queries GROUP BY status").fetchall()
+        result = {row["status"]: int(row["n"]) for row in rows}
+        result["total"] = sum(result.values())
+        return result
 
     def remove_asset(self, target_id: int, kind: str, asset_id, qty: int = 1) -> dict:
         kind = str(kind).lower().strip()

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 try:
@@ -203,8 +203,7 @@ async def guard_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dic
     player = await guard(update, context)
     if player is None:
         return None
-    if not config.is_admin(update.effective_user.id):
-        await respond(update, "⛔ <b>Admin only.</b>")
+    if not get_db(context).is_admin(update.effective_user.id):
         return None
     return player
 
@@ -258,9 +257,39 @@ def main_menu_text(player: dict) -> str:
     )
 
 
+def start_welcome_text(db: Database, player: dict) -> str:
+    user_id = int(player["user_id"])
+    try:
+        stats = game.effective_stats(db, user_id)
+        power = game.power_score(stats)
+    except Exception:
+        power = 0
+    heroes = len(db.characters(user_id))
+    return (
+        f"🐉 <b>WELCOME BACK, {ui.esc(display_name(player))}!</b>\n"
+        f"<i>Your multiverse journey is waiting.</i>\n\n"
+        f"🏅 {ui.esc(player.get('rank', 'Rookie'))} • ⚔️ {ui.fmt(power)} Power • Lv.{player.get('level', 1)}\n"
+        f"💠 {ui.fmt(player.get('yens', 0))} Yens • 💎 {ui.fmt(player.get('gems', 0))} Gems • 🔮 {ui.fmt(player.get('crystals', 0))} Crystals\n"
+        f"⚡ {player.get('stamina', 0)}/{player.get('max_stamina', 0)} Stamina • 🎴 {heroes}/{len(data.CHARACTERS)} Heroes\n\n"
+        "Pick up where you left off:\n"
+        "• /hunt — fight NPCs\n"
+        "• /arena — challenge the arena\n"
+        "• /dungeon — climb floors\n"
+        "• /daily — claim your streak\n\n"
+        "Use /menu for everything else."
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None:
+        return
+    db = get_db(context)
+    existing = db.player(update.effective_user.id)
     player = await guard(update, context)
     if player is None:
+        return
+    if existing is not None:
+        await respond(update, start_welcome_text(db, player), ui.main_menu_keyboard())
         return
     text = (
         f"🐉 <b>WELCOME TO {ui.esc(config.GAME_NAME)}</b> 🐉\n\n"
@@ -426,12 +455,148 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text += (
             "<b>🛠 Admin</b>\n"
             "/admin — panel • /admin add|remove|set &lt;user&gt; &lt;kind&gt; &lt;value&gt; [qty]\n"
+            "/admin queries • /admin query view|reply|close &lt;id&gt;\n"
             "/grant • /ban • /unban • /admin_heal • /broadcast • /backup\n"
             "/crownart — hidden custom art manager • /upload TYPE NAME\n/createcode CODE rewards [uses=] [days=] — create redeem code\n/codes — list redeem codes\n"
             "/setlevel &lt;user&gt; &lt;level&gt; • /admin_heal &lt;user&gt; • /resetplayer &lt;user&gt;\n\n"
         )
     text += "<i>Most actions are also available as inline buttons. Use /help combat|heroes|gear|clans|world for focused guides.</i>"
     await respond(update, text, help_keyboard())
+
+
+QUERY_CATEGORIES = {
+    "bug": ("🐞", "Bug"),
+    "glitch": ("⚡", "Glitch"),
+    "flaw": ("🧩", "Flaw"),
+    "suggest": ("💡", "Suggestion"),
+    "suggestion": ("💡", "Suggestion"),
+    "other": ("📝", "Other"),
+}
+
+
+def query_reporter_text(db: Database, ticket: dict) -> str:
+    user_id = int(ticket["user_id"])
+    player = db.player(user_id) or {}
+    if not player:
+        return "👤 <b>Unknown player</b>"
+    clan = db.clan(user_id)
+    characters = db.characters(user_id)
+    gear = db.gear(user_id)
+    try:
+        stats = game.effective_stats(db, user_id)
+        power = ui.fmt(game.power_score(stats))
+    except Exception:
+        power = "Unknown"
+    created = str(player.get("created_at") or "Unknown")[:10]
+    last_seen = str(player.get("last_seen") or "Unknown").replace("T", " ")[:16]
+    return (
+        f"👤 Name: <b>{ui.esc(display_name(player))}</b>\n"
+        f"🔗 Username: {('@' + ui.esc(player['username'])) if player.get('username') else 'None'}\n"
+        f"🆔 User ID: <code>{user_id}</code>\n"
+        f"💬 Chat ID: <code>{int(ticket.get('chat_id') or 0)}</code>\n"
+        f"🏅 Rank: <b>{ui.esc(player.get('rank', 'Unknown'))}</b> • Level <b>{int(player.get('level', 1))}</b>\n"
+        f"🌍 Home: {series_name(player.get('travel', 'dragonball'))}\n"
+        f"⚔️ Power: <b>{power}</b> • 🎴 Heroes: <b>{len(characters)}</b> • 🎒 Gear: <b>{len(gear)}</b>\n"
+        f"🏯 Clan: <b>{ui.esc(clan['name']) if clan else 'None'}</b>\n"
+        f"💠 {ui.fmt(player.get('yens', 0))} Yens • 💎 {ui.fmt(player.get('gems', 0))} Gems • 🔮 {ui.fmt(player.get('crystals', 0))} Crystals\n"
+        f"🏟️ Arena: <b>{player.get('arena_rating', 1000)}</b> • ⚔️ {player.get('wins', 0)}W/{player.get('losses', 0)}L\n"
+        f"📅 Joined: {ui.esc(created)} • 🕒 Last seen: {ui.esc(last_seen)}"
+    )
+
+
+def query_alert_text(ticket: dict, db: Database | None = None) -> str:
+    emoji, label = QUERY_CATEGORIES.get(ticket.get("category", "bug"), ("📝", "Query"))
+    reporter = query_reporter_text(db, ticket) if db is not None else (
+        f"👤 Name: <b>{ui.esc(ticket.get('display_name') or 'Unknown')}</b>\n"
+        f"🔗 Username: {ui.esc(ticket.get('username') or 'N/A')}\n"
+        f"🆔 User ID: <code>{ticket['user_id']}</code>\n"
+        f"💬 Chat ID: <code>{int(ticket.get('chat_id') or 0)}</code>"
+    )
+    return (
+        f"{emoji} <b>NEW QUERY {ticket['code']}</b>\n\n"
+        f"📂 Category: <b>{label}</b>\n"
+        f"{reporter}\n\n"
+        f"📝 <b>Report</b>\n{ui.esc(ticket['query_text'])}\n\n"
+        f"🛠 Admin: /admin query reply {ticket['code']} &lt;text&gt;\n"
+        f"✅ Close: /admin query close {ticket['code']} [note]"
+    )
+
+
+async def _notify_query_admins(context: ContextTypes.DEFAULT_TYPE, ticket: dict) -> str:
+    text = query_alert_text(ticket, get_db(context))
+    if config.QUERY_GROUP_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=config.QUERY_GROUP_ID,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return "group"
+        except TelegramError as exc:
+            logger.warning("Could not send query %s to support group: %s", ticket["code"], exc)
+    delivered = 0
+    admin_ids = list(dict.fromkeys([*config.ADMIN_IDS, *get_db(context).admins()]))
+    for admin_id in admin_ids:
+        if await notify_user(context, admin_id, text, ui.back_keyboard()):
+            delivered += 1
+    return "admins" if delivered else "saved"
+
+
+async def cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    args = list(context.args)
+    if not args:
+        categories = " • ".join(f"{emoji} {name}" for emoji, name in QUERY_CATEGORIES.values() if name != "Suggestion")
+        await respond(
+            update,
+            "🐞 <b>REPORT A BUG / GLITCH / FLAW</b>\n\n"
+            "Usage: /query [bug|glitch|flaw|suggest|other] &lt;details&gt;\n\n"
+            "Examples:\n"
+            "• /query bug /hunt freezes after I tap Attack\n"
+            "• /query glitch my gear vanished after unequipping\n"
+            "• /query suggest add a weekly clan tournament\n\n"
+            f"Categories: {categories}\n\n"
+            "<i>Include what you did, what happened, and any command or button involved. Screenshots can be sent with the report.</i>",
+            ui.back_keyboard("menu:main"),
+        )
+        return
+    category = "bug"
+    if args[0].lower() in QUERY_CATEGORIES:
+        category = args[0].lower()
+        args = args[1:]
+    if category == "suggestion":
+        category = "suggest"
+    text = " ".join(args).strip()
+    if len(text) < 3:
+        await respond(update, "❌ Please add a little more detail so the team can reproduce the issue. Usage: /query [bug|glitch|flaw|suggest|other] &lt;details&gt;", ui.back_keyboard("menu:main"))
+        return
+    db = get_db(context)
+    ticket = db.query_create(
+        update.effective_user.id,
+        f"@{update.effective_user.username}" if update.effective_user.username else "N/A",
+        display_name(player),
+        category,
+        text,
+        update.effective_chat.id if update.effective_chat else 0,
+    )
+    destination = await _notify_query_admins(context, ticket)
+    note = {
+        "group": "The support team has been notified in the report group.",
+        "admins": "The admin team has been notified by direct message.",
+        "saved": "Your report is saved. An admin will review it from the admin panel.",
+    }[destination]
+    await respond(
+        update,
+        f"✅ <b>QUERY {ticket['code']} SUBMITTED</b>\n\n"
+        f"{QUERY_CATEGORIES.get(category, ('📝', 'Query'))[0]} Category: <b>{QUERY_CATEGORIES.get(category, ('📝', 'Query'))[1]}</b>\n"
+        f"📝 {ui.esc(text)}\n\n"
+        f"{note}\n"
+        "Keep your query ID for follow-up.",
+        ui.back_keyboard("menu:main"),
+    )
 
 
 async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -449,8 +614,13 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    chat = update.effective_chat
     if user:
-        await respond(update, f"🆔 Your Telegram user ID: <code>{user.id}</code>")
+        chat_id = int(chat.id) if chat is not None else 0
+        chat_type = str(getattr(chat, "type", "unknown"))
+        if hasattr(chat_type, "value"):
+            chat_type = chat_type.value
+        await respond(update, f"🆔 User ID: <code>{user.id}</code>\n💬 Chat ID: <code>{chat_id}</code> • Type: <b>{ui.esc(chat_type)}</b>")
 
 
 async def cmd_userid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -469,15 +639,38 @@ async def cmd_userid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if user is None:
             return
         target = db.ensure_player(user.id, user.username, user.first_name)
+    chat = update.effective_chat
+    chat_id = int(chat.id) if chat is not None else 0
+    chat_type = str(getattr(chat, "type", "unknown"))
+    if hasattr(chat_type, "value"):
+        chat_type = chat_type.value
+    try:
+        stats = game.effective_stats(db, int(target["user_id"]))
+        power = ui.fmt(game.power_score(stats))
+    except Exception:
+        power = "Unknown"
+    clan = db.clan(int(target["user_id"]))
+    characters = db.characters(int(target["user_id"]))
+    gear = db.gear(int(target["user_id"]))
+    pets = db.pets(int(target["user_id"]))
+    last_seen = str(target.get("last_seen") or "Unknown").replace("T", " ")[:16]
     text = "\n".join([
         "🆔 <b>PLAYER LOOKUP</b>",
         "",
         f"👤 Name: <b>{ui.esc(display_name(target))}</b>",
         f"🔗 Username: {('@' + ui.esc(target['username'])) if target.get('username') else 'None'}",
         f"🆔 User ID: <code>{int(target['user_id'])}</code>",
-        f"🏅 Rank: <b>{ui.esc(target.get('rank', 'Unknown'))}</b> • Level <b>{int(target.get('level', 1))}</b>",
+        f"💬 Chat ID: <code>{chat_id}</code> • Type: <b>{ui.esc(chat_type)}</b>",
         "",
-        "Tip: /give or /trade also accept this ID or @username.",
+        f"🏅 Rank: <b>{ui.esc(target.get('rank', 'Unknown'))}</b> • Level <b>{int(target.get('level', 1))}</b> • ⚔️ Power <b>{power}</b>",
+        f"🌍 Home: {series_name(target.get('travel', 'dragonball'))} • 🏯 Clan: <b>{ui.esc(clan['name']) if clan else 'None'}</b>",
+        f"🎴 Heroes: <b>{len(characters)}</b> • 🎒 Gear: <b>{len(gear)}</b> • 🐾 Pets: <b>{len(pets)}</b>",
+        f"💠 {ui.fmt(target.get('yens', 0))} Yens • 💎 {ui.fmt(target.get('gems', 0))} Gems • 🔮 {ui.fmt(target.get('crystals', 0))} Crystals",
+        f"🎟️ {target.get('tickets', 0)} Tickets • ⚡ {target.get('stamina', 0)}/{target.get('max_stamina', 0)} Stamina",
+        f"🏟️ Arena: <b>{target.get('arena_rating', 1000)}</b> • 🏆 {target.get('wins', 0)}W/{target.get('losses', 0)}L • PvP {target.get('pvp_wins', 0)}W",
+        f"🕒 Last seen: {ui.esc(last_seen)}",
+        "",
+        "Tip: /give, /trade, /duel and /compare accept this ID or @username.",
     ])
     await respond(update, text, ui.back_keyboard())
 
@@ -510,35 +703,20 @@ def profile_text(db: Database, user_id: int) -> str:
     characters = db.characters(user_id)
     team = db.team(user_id)
     by_id = {character["id"]: character for character in characters}
-    team_names = " • ".join(ui.esc(by_id[cid]["name"]) for cid in team if cid in by_id) or "None"
+    team_names = ", ".join(ui.esc(by_id[cid]["name"]) for cid in team if cid in by_id) or "None"
     title = data.TITLES.get(player.get("title") or "", {})
     clan = db.clan(user_id)
     next_exp = db.exp_needed(int(player["level"]))
-    collection = game.series_collection(db, user_id)
-    collection_text = " • ".join(f"{data.SERIES[s]['emoji']}{collection.get(s, 0)}" for s in data.SERIES_ORDER)
-    avatar = game.avatar_for(player)
+    pet_name = next((pet["name"] for pet in db.pets(user_id) if pet.get("equipped")), "None")
     return (
-        f"{avatar['icon']} <b>{ui.esc(player.get('first_name') or player.get('username') or 'Summoner')}</b>\n"
-        f"🏅 {ui.esc(player['rank'])} • Level <b>{player['level']}</b>\n"
-        f"✨ EXP: {ui.percent_bar(player['exp'], next_exp)} ({ui.fmt(player['exp'])}/{ui.fmt(next_exp)})\n"
-        f"🌍 Home: {series_name(player.get('travel', 'dragonball'))}\n"
-        f"⚡ Stamina: {ui.percent_bar(player['stamina'], player['max_stamina'])}\n\n"
-        f"⚔️ <b>Combat Power</b> — {ui.fmt(game.power_score(stats))}\n"
-        f"❤️ HP {ui.fmt(player.get('current_hp', stats['hp']))}/{ui.fmt(stats['hp'])} • 🔵 MP {ui.fmt(player.get('mp', stats['max_mp']))}/{ui.fmt(stats['max_mp'])}\n"
-        f"⚔️ ATK {ui.fmt(stats['atk'])} • 🛡️ DEF {ui.fmt(stats['def'])} • 💨 SPD {ui.fmt(stats['spd'])}\n"
-        f"💪 STR {stats['attributes']['strength']} • 🏃 AGI {stats['attributes']['agility']} • 🧠 INT {stats['attributes']['intellect']}\n"
-        f"❤️‍🔥 VIT {stats['attributes']['vitality']} • 🍀 LUK {stats['attributes']['luck']} • 🎯 Stat Points: {player.get('stat_points', 0)}\n"
-        f"🔮 Element: {data.ELEMENTS[stats['element']]['emoji']} {data.ELEMENTS[stats['element']]['name']}\n\n"
-        f"🦸 Main: <b>{ui.esc(stats['name'])}</b>\n"
-        f"👥 Team: {team_names}\n"
-        f"👑 Avatar: {avatar['icon']} <b>{ui.esc(avatar['name'])}</b>\n"
-        f"🏷️ Title: <b>{ui.esc(title.get('name', 'None'))}</b>\n"
-        f"🐾 Companion: <b>{ui.esc(next((p['name'] for p in db.pets(user_id) if p.get('equipped')), 'None'))}</b>\n"
-        f"🏯 Clan: <b>{ui.esc(clan['name'] if clan else 'None')}</b>\n\n"
-        f"💠 {ui.fmt(player['yens'])} Yens • 💎 {ui.fmt(player['gems'])} Gems\n"
-        f"🔮 {ui.fmt(player['crystals'])} Crystals • 🎟️ {player['tickets']} Tickets • 🧠 {player['skill_points']} SP\n"
-        f"🎴 Collection: {len(characters)} heroes — {collection_text}\n"
-        f"🎯 Pity: {player['pity']}/{config.GACHA_PITY} • ⚔️ {player['wins']}W/{player['losses']}L • 🏟️ {player['arena_rating']} rating"
+        f"{game.avatar_for(player)['icon']} <b>{ui.esc(display_name(player))}</b> • {ui.esc(player['rank'])} • Lv.{player['level']}\n"
+        f"✨ EXP {ui.percent_bar(player['exp'], next_exp)} • ⚡ {player['stamina']}/{player['max_stamina']} • 🌍 {series_name(player.get('travel', 'dragonball'))}\n"
+        f"⚔️ Power <b>{ui.fmt(game.power_score(stats))}</b> • ❤️ {ui.fmt(player.get('current_hp', stats['hp']))}/{ui.fmt(stats['hp'])} • 🔵 {ui.fmt(player.get('mp', stats['max_mp']))}/{ui.fmt(stats['max_mp'])}\n"
+        f"🗡️ ATK {ui.fmt(stats['atk'])} • 🛡️ DEF {ui.fmt(stats['def'])} • 💨 SPD {ui.fmt(stats['spd'])} • {data.ELEMENTS[stats['element']]['emoji']} {data.ELEMENTS[stats['element']]['name']}\n"
+        f"🦸 <b>{ui.esc(stats['name'])}</b> • 👥 {team_names}\n"
+        f"🐾 {ui.esc(pet_name)} • 🏯 {ui.esc(clan['name'] if clan else 'None')} • 🏷️ {ui.esc(title.get('name', 'None'))}\n"
+        f"💠 {ui.fmt(player['yens'])} • 💎 {ui.fmt(player['gems'])} • 🔮 {ui.fmt(player['crystals'])} • 🎟️ {player['tickets']} • 🧠 {player['skill_points']} SP\n"
+        f"🎴 {len(characters)}/{len(data.CHARACTERS)} Heroes • 🎯 Pity {player['pity']}/{config.GACHA_PITY} • 🏟️ {player['arena_rating']} • ⚔️ {player['wins']}W/{player['losses']}L"
     )
 
 
@@ -563,7 +741,6 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         for index in range(0, len(stat_buttons), 2):
             rows.append(stat_buttons[index:index + 2])
     rows.append([InlineKeyboardButton("👑 Crown", callback_data="crown:view"), InlineKeyboardButton("🎴 Heroes", callback_data="chars:all:all:1")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     keyboard = InlineKeyboardMarkup(rows)
     player = db.require_player(update.effective_user.id)
     stats = game.effective_stats(db, update.effective_user.id)
@@ -593,9 +770,9 @@ async def characters_view(update: Update, context: ContextTypes.DEFAULT_TYPE, ar
     owned = db.characters(update.effective_user.id)
     filtered = [c for c in owned if (not series or c["series"] == series) and (not rarity or c["rarity"] == rarity)]
     filtered.sort(key=lambda c: (-data.RARITY_INDEX[c["rarity"]], -c["power"], -c["level"], c["name"]))
-    total_pages = max(1, (len(filtered) + 9) // 10)
+    total_pages = max(1, (len(filtered) + 19) // 20)
     page = min(page, total_pages)
-    page_items = filtered[(page - 1) * 10: page * 10]
+    page_items = filtered[(page - 1) * 20: page * 20]
     rarity_counts: dict[str, int] = {}
     for character in filtered:
         rarity_counts[character["rarity"]] = rarity_counts.get(character["rarity"], 0) + 1
@@ -619,12 +796,8 @@ async def characters_view(update: Update, context: ContextTypes.DEFAULT_TYPE, ar
             last_rarity = character["rarity"]
         power = game.power_score(game.scaled_character(character))
         lines.append(
-            f"{rarity_info['emoji']} {element_info['emoji']} <b>{ui.esc(character['name'])}</b> "
-            f"Lv.{character['level']} ⭐{character['stars']}"
-        )
-        lines.append(
-            f"   ⚔️ Power <b>{ui.fmt(power)}</b> • 📺 {ui.esc(data.SERIES[character['series']]['name'])}\n"
-            f"   🆔 <code>{character['id']}</code>"
+            f"{rarity_info['emoji']}{element_info['emoji']} <b>{ui.esc(character['name'])}</b> "
+            f"Lv.{character['level']}⭐{character['stars']} • ⚔️ {ui.fmt(power)}"
         )
     lines.extend(["", f"Page {page}/{total_pages} • Use /character &lt;id&gt; for details."])
     keyboard_rows: list[list[InlineKeyboardButton]] = []
@@ -648,11 +821,12 @@ async def characters_view(update: Update, context: ContextTypes.DEFAULT_TYPE, ar
     )
     for index in range(0, len(rarity_buttons), 4):
         keyboard_rows.append(rarity_buttons[index:index + 4])
-    for character in page_items:
-        keyboard_rows.append([InlineKeyboardButton(
-            f"{data.RARITIES[character['rarity']]['emoji']} {character['name']} • Lv.{character['level']}",
-            callback_data=f"char:view:{character['id']}",
-        )])
+    hero_buttons = [InlineKeyboardButton(
+        f"{data.RARITIES[character['rarity']]['emoji']} {character['name']} Lv.{character['level']}",
+        callback_data=f"char:view:{character['id']}",
+    ) for character in page_items]
+    for index in range(0, len(hero_buttons), 2):
+        keyboard_rows.append(hero_buttons[index:index + 2])
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"chars:{series or 'all'}:{rarity or 'all'}:{page - 1}"))
@@ -661,7 +835,6 @@ async def characters_view(update: Update, context: ContextTypes.DEFAULT_TYPE, ar
     if nav:
         keyboard_rows.append(nav)
     keyboard_rows.append([InlineKeyboardButton("👥 Team", callback_data="team:view"), InlineKeyboardButton("👑 Crown", callback_data="crown:view")])
-    keyboard_rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(keyboard_rows))
 
 
@@ -700,7 +873,6 @@ async def character_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, q
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚔️ Equip", callback_data=f"char:equip:{found['id']}"), InlineKeyboardButton("⬆️ Level Up", callback_data=f"char:level:{found['id']}")],
         [InlineKeyboardButton("⭐ Awaken", callback_data=f"char:awaken:{found['id']}"), InlineKeyboardButton("🎒 Heroes", callback_data="chars:all:all:1")],
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ])
     await respond(update, text, keyboard)
 
@@ -815,7 +987,6 @@ async def team_view(
         if nav:
             rows.append(nav)
     rows.append([InlineKeyboardButton("🧹 Clear Team", callback_data="team:clear"), InlineKeyboardButton("🎴 Heroes", callback_data="chars:all:all:1")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -861,9 +1032,9 @@ async def hero_picker(
         return
     filtered = [c for c in characters if (not series or c["series"] == series) and (not rarity or c["rarity"] == rarity)]
     filtered.sort(key=lambda c: (-data.RARITY_INDEX[c["rarity"]], -c["power"], -c["level"], c["name"]))
-    total_pages = max(1, (len(filtered) + 19) // 20)
+    total_pages = max(1, (len(filtered) + 23) // 24)
     page = min(max(1, page), total_pages)
-    page_items = filtered[(page - 1) * 20:page * 20]
+    page_items = filtered[(page - 1) * 24:page * 24]
     lines = [
         title,
         f"📺 {series_name(series) if series else 'All series'} • "
@@ -889,11 +1060,12 @@ async def hero_picker(
     lines.append("")
     lines.append("Tap a hero below. Use the filters to browse by series and rarity rank.")
     rows: list[list[InlineKeyboardButton]] = []
-    for character in page_items:
-        rows.append([InlineKeyboardButton(
-            f"{data.RARITIES[character['rarity']]['emoji']} {character['name']} Lv.{character['level']}",
-            callback_data=f"char:{action}:{character['id']}",
-        )])
+    pick_buttons = [InlineKeyboardButton(
+        f"{data.RARITIES[character['rarity']]['emoji']} {character['name']} Lv.{character['level']}",
+        callback_data=f"char:{action}:{character['id']}",
+    ) for character in page_items]
+    for index in range(0, len(pick_buttons), 2):
+        rows.append(pick_buttons[index:index + 2])
     series_buttons = [InlineKeyboardButton("🌐 All Series", callback_data=f"pick:{action}:all:{rarity or 'all'}:1")]
     series_buttons.extend(
         InlineKeyboardButton(
@@ -921,7 +1093,7 @@ async def hero_picker(
         nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"pick:{action}:{series or 'all'}:{rarity or 'all'}:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("🎴 All Heroes", callback_data="chars:all:all:1"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    rows.append([InlineKeyboardButton("🎴 All Heroes", callback_data="chars:all:all:1")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -1007,8 +1179,7 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 all_tags = " • ".join(game.skill_tags(skill))
                 lines.append(
                     f"{status} <b>{ui.esc(skill['name'])}</b> "
-                    f"[{ui.esc(str(skill['element']).upper())}]{cost_text} • {ui.esc(all_tags)}\n"
-                    f"   {ui.esc(game.skill_effect(skill))} • <code>{skill['id']}</code>"
+                    f"[{ui.esc(str(skill['element']).upper())}]{cost_text} • {ui.esc(all_tags)} • <code>{skill['id']}</code>"
                 )
             lines.append("")
 
@@ -1051,7 +1222,7 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     ]
     for index in range(0, len(learn_buttons), 2):
         rows.append(learn_buttons[index:index + 2])
-    rows.append([InlineKeyboardButton("🛒 Skill Shop", callback_data="menu:skillshop"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    rows.append([InlineKeyboardButton("🛒 Skill Shop", callback_data="menu:skillshop")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -1084,51 +1255,72 @@ async def cmd_skill_equip(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await respond(update, f"{'✅ Equipped' if result['equipped'] else '⚪ Unequipped'} skill.")
 
 
-async def inventory_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def inventory_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str = "items", page: int = 1) -> None:
     player = await guard(update, context)
     if player is None:
         return
     db = get_db(context)
-    items = db.items(update.effective_user.id)
-    gear = db.gear(update.effective_user.id)
-    lines = ["🎒 <b>INVENTORY</b>", ""]
-    lines.append(f"💠 {ui.fmt(player['yens'])} Yens • 💎 {ui.fmt(player['gems'])} Gems • 🔮 {ui.fmt(player['crystals'])} Crystals")
-    lines.append("")
-    lines.append("🧪 <b>Items</b>")
-    if items:
-        for item in items[:20]:
-            lines.append(f"{item['emoji']} {ui.esc(item['name'])} x{item['qty']} — <code>{item['item_id']}</code>")
+    uid = update.effective_user.id
+    items = db.items(uid)
+    gear = db.gear(uid)
+    pets = db.pets(uid)
+    category = category if category in ("items", "gear", "pets") else "items"
+    per_page = 6
+    source = {"items": items, "gear": gear, "pets": pets}[category]
+    total_pages = max(1, (len(source) + per_page - 1) // per_page)
+    page = max(1, min(int(page), total_pages))
+    shown = source[(page - 1) * per_page:page * per_page]
+    titles = {"items": "🧪 ITEMS", "gear": "⚙️ GEAR", "pets": "🐾 COMPANIONS"}
+    lines = [
+        "🎒 <b>INVENTORY</b>",
+        f"💠 {ui.fmt(player['yens'])} Yens • 💎 {ui.fmt(player['gems'])} Gems • 🔮 {ui.fmt(player['crystals'])} Crystals",
+        f"🧪 {len(items)} Items • ⚙️ {len(gear)} Gear • 🐾 {len(pets)} Pets",
+        "",
+        f"{titles[category]} — Page {page}/{total_pages}",
+    ]
+    if category == "items":
+        for item in shown:
+            lines.append(f"{item['emoji']} <b>{ui.esc(item['name'])}</b> x{item['qty']} • <code>{item['item_id']}</code>")
+    elif category == "gear":
+        for item in shown:
+            slot = f" • {item['equipped_slot']}" if item.get("equipped_slot") else ""
+            lines.append(f"{data.RARITIES[item['rarity']]['emoji']} <b>{ui.esc(item['name'])}</b> Lv.{item['level']}{slot} • <code>{item['instance_id']}</code>")
     else:
-        lines.append("No items.")
-    lines.extend(["", "⚙️ <b>Gear</b>"])
-    if gear:
-        for item in gear[:12]:
-            slot = f" [equipped: {item['equipped_slot']}]" if item.get("equipped_slot") else ""
-            lines.append(f"{data.RARITIES[item['rarity']]['emoji']} {ui.esc(item['name'])} Lv.{item['level']}{slot} — <code>{item['instance_id']}</code>")
+        for pet in shown:
+            lines.append(f"{pet['emoji']} <b>{ui.esc(pet['name'])}</b> Lv.{pet['level']}{' • equipped' if pet.get('equipped') else ''}")
+    if not shown:
+        lines.append("Nothing here yet.")
+    rows: list[list[InlineKeyboardButton]] = []
+    if category == "items":
+        for item in shown:
+            rows.append([
+                InlineKeyboardButton(f"🧪 Use {item['name'][:16]}", callback_data=f"inv:use:{item['item_id']}"),
+                InlineKeyboardButton("💠 Sell", callback_data=f"inv:sell:{item['item_id']}"),
+            ])
+    elif category == "gear":
+        gear_buttons = []
+        for item in shown:
+            label = f"{'⚪' if item.get('equipped_slot') else '⚙️'} {item['name']} Lv.{item['level']}"
+            action = f"inv:unequip:{item['equipped_slot']}" if item.get("equipped_slot") else f"inv:equip:{item['instance_id']}"
+            gear_buttons.append(InlineKeyboardButton(label[:32], callback_data=action))
+        for index in range(0, len(gear_buttons), 2):
+            rows.append(gear_buttons[index:index + 2])
     else:
-        lines.append("No gear.")
-    pets = db.pets(update.effective_user.id)
-    lines.extend(["", "🐾 <b>Companions</b>"])
-    if pets:
-        for pet in pets[:8]:
-            lines.append(f"{pet['emoji']} {ui.esc(pet['name'])} Lv.{pet['level']}{' • equipped' if pet.get('equipped') else ''}")
-    else:
-        lines.append("No companions. Hatch one with /pet_summon.")
-    lines.append("\nTap an item to use or sell, or tap gear to equip. Commands still work: /use &lt;item_id&gt;, /equip &lt;instance_id&gt;.")
-    rows = []
-    for item in items[:8]:
-        rows.append([
-            InlineKeyboardButton(f"{item['emoji']} Use {item['name']}", callback_data=f"inv:use:{item['item_id']}"),
-            InlineKeyboardButton("💠 Sell", callback_data=f"inv:sell:{item['item_id']}"),
-        ])
-    for item in gear[:8]:
-        label = f"⚙️ {item['name']} Lv.{item['level']}"
-        if item.get("equipped_slot"):
-            rows.append([InlineKeyboardButton(f"⚪ Unequip {item['name']}", callback_data=f"inv:unequip:{item['equipped_slot']}")])
-        else:
-            rows.append([InlineKeyboardButton(label, callback_data=f"inv:equip:{item['instance_id']}")])
-    rows.append([InlineKeyboardButton("🛒 Shop", callback_data="menu:shop"), InlineKeyboardButton("💚 Heal", callback_data="menu:heal")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+        pet_buttons = [InlineKeyboardButton(f"{'✅' if pet.get('equipped') else '🐾'} {pet['name']} Lv.{pet['level']}", callback_data=f"pet:view:{pet['id']}") for pet in shown]
+        for index in range(0, len(pet_buttons), 2):
+            rows.append(pet_buttons[index:index + 2])
+    tabs = []
+    for key, label in (("items", f"🧪 {len(items)}"), ("gear", f"⚙️ {len(gear)}"), ("pets", f"🐾 {len(pets)}")):
+        tabs.append(InlineKeyboardButton(("• " if key == category else "") + label, callback_data=f"inv:tab:{key}:1"))
+    rows.append(tabs)
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"inv:tab:{category}:{page - 1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"inv:tab:{category}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🛒 Shop", callback_data="menu:shop"), InlineKeyboardButton("⚙️ Gear Filters", callback_data="menu:gear")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -1206,7 +1398,7 @@ async def gear_view(update: Update, context: ContextTypes.DEFAULT_TYPE, slot: st
         filter_row.append(InlineKeyboardButton(name.title(), callback_data=f"gear:page:{name}:1"))
     for index in range(0, len(filter_row), 3):
         rows.append(filter_row[index:index + 3])
-    rows.append([InlineKeyboardButton("🎒 Inventory", callback_data="menu:inventory"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    rows.append([InlineKeyboardButton("🎒 Inventory", callback_data="menu:inventory")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -1366,7 +1558,6 @@ async def equipment_pull_view(update: Update, context: ContextTypes.DEFAULT_TYPE
         InlineKeyboardButton("🌌 All Series x1", callback_data="eqpull:all:1"),
         InlineKeyboardButton("🌌 All Series x10", callback_data="eqpull:all:10"),
     ])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -1458,9 +1649,12 @@ async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category
         offers = game.daily_shop(get_db(context))
         lines = ["🌅 <b>DAILY SHOP</b>", ""]
         rows = []
+        daily_buttons = []
         for offer in offers:
             lines.append(f"{offer['slot']}. {offer['emoji']} <b>{ui.esc(offer['name'])}</b> — {ui.fmt(offer['price'])} {offer['currency']} (-{int(offer['discount'] * 100)}%)")
-            rows.append([InlineKeyboardButton(f"{offer['emoji']} Buy {offer['name']} — {ui.fmt(offer['price'])} {offer['currency']}", callback_data=f"shop:dailybuy:{offer['slot']}")])
+            daily_buttons.append(InlineKeyboardButton(f"{offer['emoji']} {offer['name']} • {ui.fmt(offer['price'])}", callback_data=f"shop:dailybuy:{offer['slot']}"))
+        for index in range(0, len(daily_buttons), 2):
+            rows.append(daily_buttons[index:index + 2])
         rows.extend(ui.shop_keyboard().inline_keyboard)
         await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
         return
@@ -1468,7 +1662,7 @@ async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category
     if category not in labels:
         category = "all"
     entries = game.shop_catalog(category)
-    per_page = 8
+    per_page = 10
     total_pages = max(1, (len(entries) + per_page - 1) // per_page)
     page = max(1, min(int(page or 1), total_pages))
     start_index = (page - 1) * per_page
@@ -1477,11 +1671,12 @@ async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category
     if not page_entries:
         lines.append("No items in this category.")
     for entry in page_entries:
-        lines.append(f"{entry['emoji']} <b>{ui.esc(entry['name'])}</b> — {ui.fmt(entry['price'])} {entry['currency']}\n   <code>{entry['id']}</code> • {ui.esc(entry['desc'])}")
+        lines.append(f"{entry['emoji']} <b>{ui.esc(entry['name'])}</b> — {ui.fmt(entry['price'])} {entry['currency']} • <code>{entry['id']}</code>")
     lines.append("\nTap an item to choose quantity, or use /buy &lt;id&gt; [qty].")
     rows = []
-    for entry in page_entries:
-        rows.append([InlineKeyboardButton(f"{entry['emoji']} {entry['name']} — {ui.fmt(entry['price'])} {entry['currency']}", callback_data=f"shop:item:{entry['id']}:{category}:{page}")])
+    shop_buttons = [InlineKeyboardButton(f"{entry['emoji']} {entry['name']} • {ui.fmt(entry['price'])}", callback_data=f"shop:item:{entry['id']}:{category}:{page}") for entry in page_entries]
+    for index in range(0, len(shop_buttons), 2):
+        rows.append(shop_buttons[index:index + 2])
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"shop:page:{category}:{page - 1}"))
@@ -1715,7 +1910,6 @@ async def boss_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"👹 <b>{ui.esc(boss['name'])}</b> Lv.{boss['level']} • {data.ELEMENTS[boss['element']]['emoji']}")
         rows.append([InlineKeyboardButton(f"⚔️ Battle {boss['name']} Lv.{boss['level']}", callback_data=f"boss:fight:{series}:{boss['id']}")])
     rows.append([InlineKeyboardButton("🏃 Flee", callback_data="boss:flee"), InlineKeyboardButton("🌍 Travel", callback_data="menu:travel")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -1728,9 +1922,39 @@ async def cmd_boss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await boss_view(update, context)
 
 
+async def elite_view(update: Update, context: ContextTypes.DEFAULT_TYPE, series: str | None = None) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    keys = db.item_qty(update.effective_user.id, "elite_key")
+    lines = ["💀 <b>ELITE HUNT</b>", f"🗝️ Elite Keys: <b>{keys}</b> • Cost: 1 key per fight", ""]
+    if series in data.SERIES:
+        info = data.SERIES[series]
+        lines.append(f"{info['emoji']} <b>{ui.esc(info['home'])}</b>")
+        for npc in data.NPCS.get(series, [])[:6]:
+            lines.append(f"• <b>{ui.esc(npc['name'])}</b> Lv.{npc['level']} • {data.ELEMENTS[npc['element']]['emoji']} • {ui.fmt(npc['hp'])} HP")
+        rows = [
+            [InlineKeyboardButton("⚔️ Fight Random Elite", callback_data=f"elite:start:{series}")],
+            [InlineKeyboardButton("🌐 Change World", callback_data="elite:view:all")],
+        ]
+    else:
+        lines.append("Choose a world. A random NPC from that world becomes the elite.")
+        rows = []
+        buttons = [InlineKeyboardButton(f"{data.SERIES[key]['emoji']} {data.SERIES[key]['short']}", callback_data=f"elite:view:{key}") for key in data.SERIES_ORDER]
+        for index in range(0, len(buttons), 2):
+            rows.append(buttons[index:index + 2])
+        rows.append([InlineKeyboardButton("🎲 Random World", callback_data="elite:start:random")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
 async def cmd_elite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args and context.args[0].lower() in ("start", "fight"):
+        series = parse_series(context.args[1]) if len(context.args) > 1 else None
+        await start_battle(update, context, "elite", series=series)
+        return
     series = parse_series(context.args[0]) if context.args else None
-    await start_battle(update, context, "elite", series=series)
+    await elite_view(update, context, series)
 
 
 async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1855,6 +2079,247 @@ async def cmd_clanraid_attack(update: Update, context: ContextTypes.DEFAULT_TYPE
     await cmd_clanraid(update, context)
 
 
+DUEL_CURRENCIES = ("yens", "gems", "crystals", "tickets")
+DUEL_CURRENCY_ICONS = {"yens": "💠", "gems": "💎", "crystals": "🔮", "tickets": "🎟️"}
+DUEL_ASSET_ICONS = {"characters": "🎴", "pets": "🐾", "gear": "⚙️"}
+
+
+def empty_duel_stake() -> dict:
+    return {"currency": {}, "characters": [], "pets": [], "gear": []}
+
+
+def normalize_duel_stake(stake: dict | None) -> dict:
+    return Database._normalize_stake(stake)
+
+
+def duel_side(duel: dict, user_id: int) -> str | None:
+    if int(duel["challenger_id"]) == int(user_id):
+        return "challenger"
+    if int(duel["opponent_id"]) == int(user_id):
+        return "opponent"
+    return None
+
+
+def duel_can_edit(duel: dict, side: str | None) -> bool:
+    return bool(side == "challenger" and duel["status"] == "build" or side == "opponent" and duel["status"] == "wager_pending")
+
+
+def duel_stake_empty(stake: dict) -> bool:
+    stake = normalize_duel_stake(stake)
+    return not (stake["currency"] or stake["characters"] or stake["pets"] or stake["gear"])
+
+
+def duel_stake_labels(db: Database, stake: dict) -> list[str]:
+    stake = normalize_duel_stake(stake)
+    labels = [f"{DUEL_CURRENCY_ICONS.get(key, '🪙')} {ui.fmt(amount)} {key}" for key, amount in stake["currency"].items() if amount]
+    for char_id in stake["characters"]:
+        char = data.CHARACTERS.get(char_id)
+        labels.append(f"🎴 {ui.esc(char['name'] if char else char_id)}")
+    for pet_id in stake["pets"]:
+        pet = data.PETS.get(pet_id)
+        labels.append(f"🐾 {ui.esc(pet['name'] if pet else pet_id)}")
+    for instance_id in stake["gear"]:
+        gear = db.gear_instance(int(duel["challenger_id"]), int(instance_id)) or db.gear_instance(int(duel["opponent_id"]), int(instance_id))
+        labels.append(f"⚙️ {ui.esc(gear['name'] if gear else str(instance_id))}")
+    return labels
+
+
+def duel_stake_text(db: Database, duel: dict, viewer_id: int) -> str:
+    side = duel_side(duel, viewer_id)
+    if side is None:
+        return "❌ This duel is not yours."
+    opponent_id = int(duel["opponent_id"]) if side == "challenger" else int(duel["challenger_id"])
+    opponent = db.player(opponent_id) or {}
+    mine = duel[f"{side}_stake"]
+    theirs_key = "opponent_stake" if side == "challenger" else "challenger_stake"
+    theirs = duel[theirs_key]
+    icon = "⚔️" if duel["mode"] == "quick" else "💎"
+    lines = [f"{icon} <b>{'WAGER DUEL' if duel['mode'] == 'wager' else 'QUICK DUEL'}</b>", ""]
+    lines.append(f"🆚 <b>{ui.esc(display_name(db.player(int(duel['challenger_id']))))}</b> vs <b>{ui.esc(display_name(opponent))}</b>")
+    lines.append(f"📌 Status: <b>{ui.esc(str(duel['status']).replace('_', ' ').title())}</b>")
+    lines.append("")
+    my_labels = duel_stake_labels(db, mine)
+    their_labels = duel_stake_labels(db, theirs)
+    lines.append("🎁 <b>Your wager</b>")
+    lines.extend(f"• {label}" for label in my_labels) if my_labels else lines.append("• Nothing yet")
+    lines.append("")
+    lines.append("🎁 <b>Opponent wager</b>")
+    lines.extend(f"• {label}" for label in their_labels) if their_labels else lines.append("• Nothing yet")
+    if duel["mode"] == "wager":
+        lines.append("")
+        lines.append("Both sides keep what they stake unless the other wins. No hidden fees.")
+    return "\n".join(lines)
+
+
+def duel_builder_keyboard(duel: dict, viewer_id: int, db: Database) -> InlineKeyboardMarkup:
+    duel_id = int(duel["id"])
+    side = duel_side(duel, viewer_id)
+    status = duel["status"]
+    can_edit = side == "challenger" and status == "build" or side == "opponent" and status == "wager_pending"
+    rows = []
+    if can_edit:
+        rows.append([
+            InlineKeyboardButton("💰 Currency", callback_data=f"duel:cur:{duel_id}"),
+            InlineKeyboardButton("🎴 Heroes", callback_data=f"duel:pick:{duel_id}:characters:0"),
+        ])
+        rows.append([
+            InlineKeyboardButton("🐾 Pets", callback_data=f"duel:pick:{duel_id}:pets:0"),
+            InlineKeyboardButton("⚙️ Gear", callback_data=f"duel:pick:{duel_id}:gear:0"),
+        ])
+        if side == "challenger":
+            rows.append([InlineKeyboardButton("📨 Send Challenge", callback_data=f"duel:send:{duel_id}")])
+        else:
+            rows.append([InlineKeyboardButton("✅ Ready to Fight", callback_data=f"duel:ready:{duel_id}")])
+        rows.append([InlineKeyboardButton("❌ Cancel Wager", callback_data=f"duel:cancel:{duel_id}")])
+    elif side == "challenger" and status == "wager_ready":
+        rows.append([InlineKeyboardButton("⚔️ Accept & Fight", callback_data=f"duel:fight:{duel_id}")])
+        rows.append([InlineKeyboardButton("❌ Cancel Wager", callback_data=f"duel:cancel:{duel_id}")])
+    elif side == "challenger" and status == "accepted":
+        rows.append([InlineKeyboardButton("⚔️ Start Quick Duel", callback_data=f"duel:fight:{duel_id}")])
+        rows.append([InlineKeyboardButton("❌ Cancel Duel", callback_data=f"duel:cancel:{duel_id}")])
+    else:
+        rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"duel:view:{duel_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def duel_view(update: Update, context: ContextTypes.DEFAULT_TYPE, duel_id: int, note: str | None = None) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    duel = db.duel(duel_id)
+    if duel is None:
+        await respond(update, "❌ Duel not found.")
+        return
+    if duel_side(duel, update.effective_user.id) is None:
+        await respond(update, "❌ This duel belongs to other players.")
+        return
+    text = duel_stake_text(db, duel, update.effective_user.id)
+    if note:
+        text += "\n\n" + note
+    await respond(update, text, duel_builder_keyboard(duel, update.effective_user.id, db))
+
+
+def duel_currency_keyboard(duel: dict, player: dict) -> InlineKeyboardMarkup:
+    duel_id = int(duel["id"])
+    rows = []
+    for key in DUEL_CURRENCIES:
+        balance = int(player.get(key, 0))
+        if balance <= 0:
+            continue
+        rows.append([
+            InlineKeyboardButton(f"{DUEL_CURRENCY_ICONS[key]} {key.title()} • {ui.fmt(balance)}", callback_data=f"duel:curmenu:{duel_id}:{key}"),
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Back to Wager", callback_data=f"duel:view:{duel_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def duel_currency_menu(duel_id: int, key: str, balance: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("+1,000", callback_data=f"duel:addcur:{duel_id}:{key}:1000"),
+            InlineKeyboardButton("+10%", callback_data=f"duel:addcur:{duel_id}:{key}:pct10"),
+        ],
+        [
+            InlineKeyboardButton("+25%", callback_data=f"duel:addcur:{duel_id}:{key}:pct25"),
+            InlineKeyboardButton("✏️ Type Amount", callback_data=f"duel:custom:{duel_id}:{key}"),
+        ],
+        [InlineKeyboardButton("🗑️ Clear", callback_data=f"duel:addcur:{duel_id}:{key}:clear")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"duel:view:{duel_id}")],
+    ])
+
+
+async def duel_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, duel_id: int, kind: str, page: int) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    duel = db.duel(duel_id)
+    if duel is None or duel_side(duel, update.effective_user.id) is None:
+        await respond(update, "❌ Duel not found.")
+        return
+    side = duel_side(duel, update.effective_user.id)
+    can_edit = side == "challenger" and duel["status"] == "build" or side == "opponent" and duel["status"] == "wager_pending"
+    if not can_edit:
+        await respond(update, "🔒 Your wager is locked. Wait for the other side.", duel_builder_keyboard(duel, update.effective_user.id, db))
+        return
+    uid = update.effective_user.id
+    if kind == "characters":
+        assets = db.characters(uid)
+        labels = [(char["id"], f"{data.RARITIES.get(char['rarity'], {}).get('emoji', '🎴')} {char['name']} Lv.{char['level']}") for char in assets]
+    elif kind == "pets":
+        assets = db.pets(uid)
+        labels = [(pet["id"], f"{pet['emoji']} {pet['name']} Lv.{pet['level']}") for pet in assets]
+    else:
+        assets = db.gear(uid)
+        labels = [(str(item["instance_id"]), f"{data.RARITIES.get(item['rarity'], {}).get('emoji', '⚙️')} {item['name']} Lv.{item['level']}") for item in assets]
+    per_page = 8
+    total_pages = max(1, (len(labels) + per_page - 1) // per_page)
+    page = max(0, min(int(page), total_pages - 1))
+    shown = labels[page * per_page:(page + 1) * per_page]
+    stake = duel[f"{side}_stake"]
+    chosen = set(stake.get(kind) or [])
+    title = {"characters": "HEROES", "pets": "COMPANIONS", "gear": "GEAR"}[kind]
+    lines = [f"{DUEL_ASSET_ICONS[kind]} <b>CHOOSE {title}</b>", f"Page {page + 1}/{total_pages} • Tap to add or remove", ""]
+    if not labels:
+        lines.append("Nothing available here.")
+    rows = []
+    for index in range(0, len(shown), 2):
+        row = []
+        for asset_id, label in shown[index:index + 2]:
+            picked = str(asset_id) in chosen
+            row.append(InlineKeyboardButton(("✅ " if picked else "➕ ") + label[:28], callback_data=f"duel:toggle:{duel_id}:{kind}:{asset_id}"))
+        rows.append(row)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"duel:pick:{duel_id}:{kind}:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"duel:pick:{duel_id}:{kind}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("⬅️ Back to Wager", callback_data=f"duel:view:{duel_id}")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def handle_duel_amount(update: Update, context: ContextTypes.DEFAULT_TYPE, duel_id: int, currency: str) -> None:
+    message = update.effective_message
+    if message is None or update.effective_user is None:
+        return
+    text = (message.text or "").strip().replace(",", "").replace("_", "")
+    if text.lower() in ("cancel", "stop"):
+        context.user_data.pop("duel_amount", None)
+        await respond(update, "❌ Amount entry cancelled.")
+        return
+    if not text.isdigit() or int(text) <= 0:
+        context.user_data["duel_amount"] = (duel_id, currency)
+        await respond(update, "❌ Send a positive number. Example: <code>2500</code>")
+        return
+    player = get_db(context).require_player(update.effective_user.id)
+    amount = int(text)
+    if amount > int(player.get(currency, 0)):
+        context.user_data["duel_amount"] = (duel_id, currency)
+        await respond(update, f"❌ You only have {ui.fmt(player.get(currency, 0))} {currency}.")
+        return
+    db = get_db(context)
+    duel = db.duel(duel_id)
+    if duel is None or duel_side(duel, update.effective_user.id) is None:
+        await respond(update, "❌ Duel not found.")
+        return
+    side = duel_side(duel, update.effective_user.id)
+    if not duel_can_edit(duel, side):
+        context.user_data.pop("duel_amount", None)
+        await respond(update, "🔒 Your wager is locked. Wait for the other side.")
+        return
+    stake = duel[f"{side}_stake"]
+    stake["currency"][currency] = amount
+    db.update_duel(duel_id, **{f"{side}_stake": stake})
+    await duel_view(update, context, duel_id, f"✅ Set your {currency} wager to {ui.fmt(amount)}.")
+
+
+async def send_duel_message(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, keyboard=None) -> None:
+    await notify_user(context, user_id, text, keyboard)
+
+
 async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     player = await guard(update, context)
     if player is None:
@@ -1869,11 +2334,300 @@ async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if target is None:
         await respond(update, "Usage: /duel &lt;user_id|@username&gt; or reply to a player's message.")
         return
-    await start_battle(update, context, "duel", opponent_id=int(target["user_id"]))
+    if int(target["user_id"]) == int(update.effective_user.id):
+        await respond(update, "❌ You cannot duel yourself.")
+        return
+    existing = db.active_duel_between(update.effective_user.id, int(target["user_id"]))
+    if existing:
+        await respond(update, f"⚠️ You already have an active duel with {ui.esc(display_name(target))}.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("👀 Open Duel", callback_data=f"duel:view:{existing['id']}")],
+        ]))
+        return
+    target_id = int(target["user_id"])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Quick Duel", callback_data=f"duel:new:{target_id}:quick"), InlineKeyboardButton("💎 Wager Duel", callback_data=f"duel:new:{target_id}:wager")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="menu:profile")],
+    ])
+    await respond(
+        update,
+        f"⚔️ <b>CHALLENGE {ui.esc(display_name(target))}</b>\n\n"
+        "⚡ <b>Quick Duel</b> — no stakes, rating and standard rewards only.\n"
+        "💎 <b>Wager Duel</b> — both players add currency, heroes, pets or gear. Winner takes the opponent's wager.\n\n"
+        "The opponent must accept before any fight begins.",
+        keyboard,
+    )
+
+
+async def handle_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]) -> None:
+    query = update.callback_query
+    if query is None or update.effective_user is None:
+        return
+    action = parts[1] if len(parts) > 1 else "view"
+    db = get_db(context)
+    uid = update.effective_user.id
+    if action == "new":
+        if len(parts) < 4 or not parts[2].isdigit() or parts[3] not in ("quick", "wager"):
+            await respond(update, "❌ Invalid duel choice.")
+            return
+        target = db.player(int(parts[2]))
+        if target is None or int(target["user_id"]) == int(uid):
+            await respond(update, "❌ That player is unavailable.")
+            return
+        existing = db.active_duel_between(uid, int(target["user_id"]))
+        if existing:
+            await respond(update, "⚠️ You already have an active duel with that player.")
+            return
+        mode = parts[3]
+        duel_id = db.create_duel(uid, int(target["user_id"]), mode)
+        duel = db.duel(duel_id)
+        target_name = ui.esc(display_name(target))
+        if mode == "quick":
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Accept Duel", callback_data=f"duel:accept:{duel_id}"), InlineKeyboardButton("❌ Decline", callback_data=f"duel:decline:{duel_id}")],
+            ])
+            await send_duel_message(
+                context, int(target["user_id"]),
+                f"⚔️ <b>QUICK DUEL CHALLENGE</b>\n\n<b>{ui.esc(display_name(db.player(uid)))}</b> challenges you to a quick duel.\nNo assets are at risk — only rating, pride and standard duel rewards.",
+                keyboard,
+            )
+            await respond(update, f"📨 Quick duel challenge sent to <b>{target_name}</b>.\n\nYou can start the fight once they accept.", InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel Challenge", callback_data=f"duel:cancel:{duel_id}")],
+            ]))
+        else:
+            await respond(update, "💎 Build your wager. Add any mix of currency, heroes, pets and gear, then send the challenge.", duel_builder_keyboard(duel, uid, db))
+        return
+    if action == "accept":
+        duel = db.duel(int(parts[2])) if len(parts) > 2 and parts[2].isdigit() else None
+        if duel is None or int(duel["opponent_id"]) != int(uid):
+            await respond(update, "❌ This challenge is not yours.")
+            return
+        if duel["status"] != "pending":
+            await respond(update, "⚠️ This challenge was already handled.")
+            return
+        db.update_duel(duel["id"], status="accepted")
+        challenger = db.player(int(duel["challenger_id"]))
+        await send_duel_message(
+            context, int(duel["challenger_id"]),
+            f"✅ <b>{ui.esc(display_name(db.player(uid)))} accepted your quick duel!</b>\nTap below to start the fight.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⚔️ Start Fight", callback_data=f"duel:fight:{duel['id']}")]]),
+        )
+        await respond(update, f"✅ You accepted <b>{ui.esc(display_name(challenger))}</b>'s duel. The challenger will start the fight.")
+        return
+    if action == "decline":
+        duel = db.duel(int(parts[2])) if len(parts) > 2 and parts[2].isdigit() else None
+        if duel is None or int(duel["opponent_id"]) != int(uid):
+            await respond(update, "❌ This challenge is not yours.")
+            return
+        if duel["status"] not in ("pending", "wager_pending"):
+            await respond(update, "⚠️ This challenge was already handled or locked.")
+            return
+        db.update_duel(duel["id"], status="declined")
+        await send_duel_message(context, int(duel["challenger_id"]), f"❌ <b>{ui.esc(display_name(db.player(uid)))}</b> declined your duel challenge.")
+        await respond(update, "❌ Challenge declined.")
+        return
+    if action not in ("view", "cur", "curmenu", "addcur", "pick", "toggle", "send", "ready", "fight", "cancel", "custom"):
+        return
+    if len(parts) < 3 or not parts[2].isdigit():
+        await respond(update, "❌ Invalid duel.")
+        return
+    duel_id = int(parts[2])
+    duel = db.duel(duel_id)
+    if duel is None:
+        await respond(update, "❌ Duel not found.")
+        return
+    side = duel_side(duel, uid)
+    if side is None:
+        await respond(update, "❌ This duel belongs to other players.")
+        return
+    if action == "view":
+        await duel_view(update, context, duel_id)
+        return
+    if action == "cur":
+        if duel["status"] == "build" and side != "challenger" or duel["status"] == "wager_pending" and side != "opponent":
+            await respond(update, "🔒 Your wager is locked.", duel_builder_keyboard(duel, uid, db))
+            return
+        player = db.require_player(uid)
+        await respond(update, "💰 <b>ADD CURRENCY</b>\nChoose a currency, then an amount. You can type any exact amount.", duel_currency_keyboard(duel, player))
+        return
+    if action == "curmenu" and len(parts) > 3 and parts[3] in DUEL_CURRENCIES:
+        if not duel_can_edit(duel, side):
+            await respond(update, "🔒 Your wager is locked.", duel_builder_keyboard(duel, uid, db))
+            return
+        key = parts[3]
+        player = db.require_player(uid)
+        await respond(update, f"{DUEL_CURRENCY_ICONS[key]} <b>{key.upper()} WAGER</b>\nBalance: <b>{ui.fmt(player.get(key, 0))}</b>\n\nPick a quick amount or type an exact number.", duel_currency_menu(duel_id, key, int(player.get(key, 0))))
+        return
+    if action == "custom" and len(parts) > 3 and parts[3] in DUEL_CURRENCIES:
+        if not duel_can_edit(duel, side):
+            await respond(update, "🔒 Your wager is locked.", duel_builder_keyboard(duel, uid, db))
+            return
+        context.user_data["duel_amount"] = (duel_id, parts[3])
+        await respond(update, f"✏️ Send the {parts[3]} amount you want to wager. Example: <code>2500</code>\nType <b>cancel</b> to abort.")
+        return
+    if action == "addcur" and len(parts) > 4 and parts[3] in DUEL_CURRENCIES:
+        if duel["status"] == "build" and side != "challenger" or duel["status"] == "wager_pending" and side != "opponent":
+            await respond(update, "🔒 Your wager is locked.", duel_builder_keyboard(duel, uid, db))
+            return
+        key, mode = parts[3], parts[4]
+        player = db.require_player(uid)
+        balance = int(player.get(key, 0))
+        stake = duel[f"{side}_stake"]
+        if mode == "clear":
+            stake["currency"].pop(key, None)
+            amount = 0
+        else:
+            if mode == "pct10":
+                amount = max(1, balance // 10)
+            elif mode == "pct25":
+                amount = max(1, balance // 4)
+            else:
+                amount = int(mode) if mode.isdigit() else 0
+            amount = min(balance, amount)
+            if amount <= 0:
+                await respond(update, f"❌ You do not have any {key}.", duel_currency_menu(duel_id, key, balance))
+                return
+            stake["currency"][key] = amount
+        db.update_duel(duel_id, **{f"{side}_stake": stake})
+        await duel_view(update, context, duel_id, f"✅ {key.title()} wager set to {ui.fmt(amount)}." if mode != "clear" else f"🗑️ Removed {key} from your wager.")
+        return
+    if action == "pick" and len(parts) > 4 and parts[3] in ("characters", "pets", "gear"):
+        page = int(parts[4]) if parts[4].isdigit() else 0
+        await duel_picker(update, context, duel_id, parts[3], page)
+        return
+    if action == "toggle" and len(parts) > 5 and parts[3] in ("characters", "pets", "gear"):
+        if duel["status"] == "build" and side != "challenger" or duel["status"] == "wager_pending" and side != "opponent":
+            await respond(update, "🔒 Your wager is locked.", duel_builder_keyboard(duel, uid, db))
+            return
+        kind, asset_id = parts[3], parts[4]
+        if kind == "characters":
+            owned = any(str(c["id"]) == str(asset_id) for c in db.characters(uid))
+        elif kind == "pets":
+            owned = any(str(pet["id"]) == str(asset_id) for pet in db.pets(uid))
+        else:
+            owned = any(str(item["instance_id"]) == str(asset_id) for item in db.gear(uid))
+        if not owned:
+            await respond(update, "❌ You do not own that asset.")
+            return
+        stake = duel[f"{side}_stake"]
+        values = list(stake.get(kind) or [])
+        key = int(asset_id) if kind == "gear" else str(asset_id)
+        if key in values:
+            values.remove(key)
+        else:
+            values.append(key)
+        stake[kind] = values
+        db.update_duel(duel_id, **{f"{side}_stake": stake})
+        await duel_view(update, context, duel_id)
+        return
+    if action == "send":
+        if side != "challenger" or duel["status"] != "build":
+            await respond(update, "❌ This wager cannot be sent now.")
+            return
+        if duel_stake_empty(duel["challenger_stake"]):
+            await respond(update, "❌ Add at least one asset or currency amount to your wager.")
+            return
+        check = db.validate_stake(uid, duel["challenger_stake"])
+        if not check["ok"]:
+            await respond(update, f"❌ {ui.esc(check['reason'])}")
+            return
+        db.update_duel(duel_id, status="wager_pending", challenger_ready=1)
+        duel = db.duel(duel_id)
+        target = db.player(int(duel["opponent_id"]))
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💎 Set My Wager", callback_data=f"duel:view:{duel_id}"), InlineKeyboardButton("❌ Decline", callback_data=f"duel:decline:{duel_id}")],
+        ])
+        await send_duel_message(
+            context, int(duel["opponent_id"]),
+            f"💎 <b>WAGER DUEL CHALLENGE</b>\n\n<b>{ui.esc(display_name(db.player(uid)))}</b> staked assets and challenges you.\nOpen the wager, add your own stake, then accept.",
+            keyboard,
+        )
+        await respond(update, "📨 Wager challenge sent. Your stake is locked until the duel ends or is cancelled.", duel_builder_keyboard(duel, uid, db))
+        return
+    if action == "ready":
+        if side != "opponent" or duel["status"] != "wager_pending":
+            await respond(update, "❌ This wager cannot be accepted now.")
+            return
+        if duel_stake_empty(duel["opponent_stake"]):
+            await respond(update, "❌ Add at least one asset or currency amount to your wager.")
+            return
+        check = db.validate_stake(uid, duel["opponent_stake"])
+        if not check["ok"]:
+            await respond(update, f"❌ {ui.esc(check['reason'])}")
+            return
+        db.update_duel(duel_id, status="wager_ready", opponent_ready=1)
+        duel = db.duel(duel_id)
+        await send_duel_message(
+            context, int(duel["challenger_id"]),
+            f"✅ <b>{ui.esc(display_name(db.player(uid)))}</b> accepted your wager.\nReview both stakes, then accept the fight. The loser's wager goes to the winner.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⚔️ Accept &amp; Fight", callback_data=f"duel:fight:{duel_id}")]]),
+        )
+        await respond(update, "✅ Wager locked. Wait for the challenger to accept the fight.", duel_builder_keyboard(duel, uid, db))
+        return
+    if action == "fight":
+        if side != "challenger" or duel["status"] not in ("accepted", "wager_ready"):
+            await respond(update, "❌ Only the challenger can start this duel.")
+            return
+        if duel["mode"] == "wager":
+            check = db.validate_duel_stakes(duel_id)
+            if not check["ok"]:
+                await respond(update, f"❌ Wager invalid: {ui.esc(check['reason'])}")
+                return
+        active = db.active_battle(uid)
+        if active:
+            await respond(update, f"❌ Finish your active battle first: {ui.esc(active.get('title', 'Battle'))}", InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚔️ Resume Battle", callback_data=f"status:battle:{active['battle_id']}")],
+            ]))
+            return
+        db.update_duel(duel_id, status="active")
+        result = battle.start(db, uid, "duel", opponent_id=int(duel["opponent_id"]), duel_id=duel_id)
+        if not result["ok"] or result.get("resumed"):
+            db.update_duel(duel_id, status="accepted" if duel["mode"] == "quick" else "wager_ready")
+            await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not start the duel.'))}")
+            return
+        await send_duel_message(context, int(duel["opponent_id"]), f"⚔️ The duel against <b>{ui.esc(display_name(db.player(uid)))}</b> has started. May the better fighter win!")
+        await show_battle(update, context, result["battle"])
+        return
+    if action == "cancel":
+        if duel["status"] in ("accepted", "wager_pending", "wager_ready", "build", "pending"):
+            db.update_duel(duel_id, status="cancelled")
+            other_id = int(duel["opponent_id"]) if side == "challenger" else int(duel["challenger_id"])
+            await send_duel_message(context, other_id, f"❌ <b>{ui.esc(display_name(db.player(uid)))}</b> cancelled the duel wager.")
+            await respond(update, "❌ Duel cancelled. No assets were moved.")
+        else:
+            await respond(update, "⚠️ This duel can no longer be cancelled.")
+        return
+
+
+async def arena_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    candidates = db.arena_candidates(update.effective_user.id, 8)
+    lines = [
+        "🏟️ <b>ARENA</b>",
+        f"🏆 Your Rating: <b>{player.get('arena_rating', 1000)}</b> • ⚔️ {player.get('pvp_wins', 0)} PvP wins",
+        f"⚡ Stamina: {player['stamina']}/{player['max_stamina']} • Cost: 15 stamina",
+        "",
+        "Choose an opponent. Higher rating gives tougher fights and better bragging rights.",
+    ]
+    rows = []
+    for index, opponent in enumerate(candidates, 1):
+        name = display_name(opponent)
+        rating = int(opponent.get("arena_rating", 1000))
+        lines.append(f"{index}. <b>{ui.esc(name)}</b> — Lv.{opponent.get('level', 1)} • 🏆 {rating}")
+        rows.append([InlineKeyboardButton(f"⚔️ {name} • {rating}", callback_data=f"arena:fight:{int(opponent['user_id'])}")])
+    if not candidates:
+        lines.append("No arena opponents available yet. Invite more players!")
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="arena:refresh")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def cmd_arena(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start_battle(update, context, "arena")
+    if context.args and context.args[0].lower() in ("start", "fight", "random"):
+        await start_battle(update, context, "arena")
+        return
+    await arena_view(update, context)
 
 
 async def leaderboard_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str = "wealth") -> None:
@@ -1973,26 +2727,26 @@ async def clan_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     members = info["members"]
     art = db.art_get("clan", clan_art_key(clan))
+    leader = next((m for m in members if m.get("role") == "leader"), None)
+    leader_name = (leader.get("first_name") or leader.get("username") or "Unknown") if leader else "Unknown"
     lines = [
         f"🏯 <b>{ui.esc(info['name'])}</b> [{ui.esc(info['tag'])}]",
-        f"Level {info['level']} • EXP {ui.fmt(info['exp'])} • {len(members)}/30 members",
-        f"💰 Treasury: 💠 {ui.fmt(info['treasury_yens'])} • 💎 {ui.fmt(info['treasury_gems'])} • 🔮 {ui.fmt(info['treasury_crystals'])}",
+        f"✨ Slogan: {ui.esc(info.get('description') or 'No description yet.')}",
         f"📢 {ui.esc(info['announcement'] or 'No announcement.')}",
-        f"📝 {ui.esc(info.get('description') or 'No description yet.')}",
+        f"👑 Leader: {ui.esc(leader_name)}",
+        f"📊 Status: Level {info['level']} • EXP {ui.fmt(info['exp'])} • {len(members)}/30 members",
+        f"💰 Treasury: 💠 {ui.fmt(info['treasury_yens'])} • 💎 {ui.fmt(info['treasury_gems'])} • 🔮 {ui.fmt(info['treasury_crystals'])}",
+        f"📋 Requirements: Lv.{info.get('min_level', 1)} • {'Open join' if info.get('open_join', 1) else 'Invite only'}",
         f"🔗 Group: {('<code>' + ui.esc(info.get('group_link')) + '</code>') if info.get('group_link') else 'Not set'}",
-        f"🖼️ Clan image: {'Uploaded' if art else 'Not set'}",
-        f"⚙️ Join: {'Open' if info.get('open_join', 1) else 'Invite only'} • Min level {info.get('min_level', 1)}",
-        "",
-        "Choose an option below to view treasury, members, raids, or manage the clan.",
+        f"🖼️ Image: {'Uploaded' if art else 'Not set'}",
     ]
     rows = [
-        [InlineKeyboardButton("💰 Treasury", callback_data="clan:treasury"), InlineKeyboardButton("👥 Members", callback_data="clan:members")],
-        [InlineKeyboardButton("🏯 Clan Raid", callback_data="menu:clanraid"), InlineKeyboardButton("⚙️ Manage", callback_data="clan:manage")],
+        [InlineKeyboardButton("👥 Members", callback_data="clan:members"), InlineKeyboardButton("💰 Treasury", callback_data="clan:treasury")],
+        [InlineKeyboardButton("⚙️ Manage", callback_data="clan:manage"), InlineKeyboardButton("🏯 Raid", callback_data="menu:clanraid")],
         [InlineKeyboardButton("🏆 Top Clans", callback_data="lb:clans"), InlineKeyboardButton("🚪 Leave Clan", callback_data="clan:leave_request")],
     ]
     if art:
         rows.append([InlineKeyboardButton("🖼️ View Clan Image", callback_data="clan:image:view")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -2007,6 +2761,9 @@ async def clan_treasury_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await respond(update, "❌ You are not in a clan.", ui.back_keyboard("menu:clan"))
         return
     info = db.clan_info(clan["id"])
+    role = str(member.get("role", "member")).title()
+    allowance = int(member.get("withdraw_allowance") or 0)
+    withdrawn = int(member.get("withdrawn") or 0)
     lines = [
         f"💰 <b>CLAN TREASURY — {ui.esc(clan['name'])}</b>",
         "",
@@ -2015,14 +2772,19 @@ async def clan_treasury_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🔮 Crystals: <b>{ui.fmt(info['treasury_crystals'])}</b>",
         f"🏅 Clan level: <b>{info['level']}</b> • EXP: <b>{ui.fmt(info['exp'])}</b>",
         f"🎁 Your total donation: <b>{ui.fmt(member.get('donation', 0))}</b>",
+        f"🔐 Role: <b>{role}</b> • Weekly withdrawal: <b>{ui.fmt(withdrawn)}/{ui.fmt(allowance)}</b>",
         "",
-        "Donations fund clan progression and raids.",
+        "Donations fund clan progression and raids. Leaders set weekly withdrawal allowances with /clan allowance &lt;user&gt; &lt;amount&gt;.",
+        "Withdraw any exact amount with /clan withdraw &lt;yens|gems|crystals&gt; &lt;amount&gt;.",
     ]
-    keyboard = InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("💠 Donate 1,000", callback_data="clan:donate:yens:1000"), InlineKeyboardButton("💠 Donate 10,000", callback_data="clan:donate:yens:10000")],
         [InlineKeyboardButton("💎 Donate 100", callback_data="clan:donate:gems:100"), InlineKeyboardButton("🔮 Donate 10", callback_data="clan:donate:crystals:10")],
+        [InlineKeyboardButton("💠 Withdraw 1,000", callback_data="clan:withdraw:yens:1000"), InlineKeyboardButton("💎 Withdraw 100", callback_data="clan:withdraw:gems:100")],
+        [InlineKeyboardButton("🔮 Withdraw 10", callback_data="clan:withdraw:crystals:10")],
         [InlineKeyboardButton("⬅️ Clan", callback_data="menu:clan")],
-    ])
+    ]
+    keyboard = InlineKeyboardMarkup(rows)
     await respond(update, "\n".join(lines), keyboard)
 
 
@@ -2067,21 +2829,24 @@ async def clan_manage_view(update: Update, context: ContextTypes.DEFAULT_TYPE, n
         return
     info = db.clan_info(clan["id"])
     art = db.art_get("clan", clan_art_key(clan))
+    open_join = bool(info.get("open_join", 1))
     lines = [
         f"⚙️ <b>MANAGE CLAN — {ui.esc(clan['name'])}</b>",
         "",
-        f"📝 Description: {ui.esc(info.get('description') or 'Not set')}",
+        f"✨ Slogan: {ui.esc(info.get('description') or 'Not set')}",
+        f"📢 Announcement: {ui.esc(info.get('announcement') or 'Not set')}",
         f"🔗 Group link: {ui.esc(info.get('group_link') or 'Not set')}",
         f"🖼️ Clan image: {'Uploaded' if art else 'Not set'}",
+        f"📋 Requirements: Lv.{info.get('min_level', 1)} • {'Open join' if open_join else 'Invite only'}",
         "",
-        "Choose what to edit. You can also use /clan desc &lt;text&gt; and /clan link &lt;url&gt;.",
+        "Tap an option to update it.",
     ]
     if note:
         lines.extend(["", note])
     rows = [
-        [InlineKeyboardButton("📝 Add/Edit Description", callback_data="clan:manage:description")],
-        [InlineKeyboardButton("🔗 Add/Edit Group Link", callback_data="clan:manage:group_link")],
-        [InlineKeyboardButton("🖼️ Add/Edit Clan Image", callback_data="clan:manage:image")],
+        [InlineKeyboardButton("✨ Edit Slogan", callback_data="clan:manage:description"), InlineKeyboardButton("📢 Edit Announcement", callback_data="clan:manage:announcement")],
+        [InlineKeyboardButton("🔗 Group Link", callback_data="clan:manage:group_link"), InlineKeyboardButton("🖼️ Clan Image", callback_data="clan:manage:image")],
+        [InlineKeyboardButton(f"🔓 Join: {'Open' if open_join else 'Invite only'}", callback_data="clan:manage:toggle_join"), InlineKeyboardButton(f"🎚 Min Level: {info.get('min_level', 1)}", callback_data="clan:manage:min_level")],
     ]
     if art:
         rows.append([InlineKeyboardButton("🔍 View Clan Image", callback_data="clan:image:view")])
@@ -2100,7 +2865,11 @@ async def clan_manage_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
     getattr(context, "user_data", {})["clan_manage"] = field
     if field == "description":
-        text = "📝 <b>New description</b>\n\nSend the new clan description as your next message (max 200 characters).\nCancel with /clan manage."
+        text = "✨ <b>New slogan</b>\n\nSend the new clan slogan as your next message (max 200 characters).\nCancel with /clan manage."
+    elif field == "announcement":
+        text = "📢 <b>New announcement</b>\n\nSend the announcement as your next message (max 200 characters).\nCancel with /clan manage."
+    elif field == "min_level":
+        text = "🎚 <b>Minimum join level</b>\n\nSend a number from 1 to 100.\nCancel with /clan manage."
     elif field == "group_link":
         text = "🔗 <b>New group link</b>\n\nSend the group link as your next message. It must start with http:// or https://.\nCancel with /clan manage."
     else:
@@ -2109,6 +2878,14 @@ async def clan_manage_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 async def handle_clan_manage_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    duel_amount = getattr(context, "user_data", {}).pop("duel_amount", None)
+    if duel_amount is not None:
+        message = update.effective_message
+        if message is not None and (message.text or "").strip().lower() in ("cancel", "/cancel"):
+            await respond(update, "✅ Custom wager cancelled.")
+            return
+        await handle_duel_amount(update, context, int(duel_amount[0]), duel_amount[1])
+        return
     field = getattr(context, "user_data", {}).get("clan_manage")
     if not field:
         return
@@ -2145,7 +2922,16 @@ async def handle_clan_manage_input(update: Update, context: ContextTypes.DEFAULT
         return
     if field == "description":
         result = db.clan_set_description(update.effective_user.id, text)
-        ok_text = "✅ Clan description updated."
+        ok_text = "✅ Clan slogan updated."
+    elif field == "announcement":
+        result = db.clan_announce(update.effective_user.id, text)
+        ok_text = "✅ Clan announcement updated."
+    elif field == "min_level":
+        if not text.isdigit():
+            await respond(update, "❌ Send a number from 1 to 100, or cancel with /clan manage.")
+            return
+        result = db.clan_settings(update.effective_user.id, min_level=int(text))
+        ok_text = "✅ Minimum join level updated."
     else:
         result = db.clan_set_group_link(update.effective_user.id, text)
         ok_text = "✅ Clan group link updated."
@@ -2329,6 +3115,29 @@ async def cmd_clan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         result = db.clan_settings(update.effective_user.id, min_level=int(rest[0]))
         await respond(update, f"⚙️ Minimum join level set to {rest[0]}." if result["ok"] else f"❌ {ui.esc(result['reason'])}")
         return
+    if sub == "allowance":
+        if len(rest) < 2 or not rest[-1].isdigit():
+            await respond(update, "Usage: /clan allowance &lt;user|@username&gt; &lt;weekly limit&gt;")
+            return
+        amount = int(rest[-1])
+        target_query = " ".join(rest[:-1]).strip()
+        result = db.clan_set_allowance(update.effective_user.id, target_query, amount)
+        if not result.get("ok"):
+            await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not set allowance.'))}")
+            return
+        target = result["member"]
+        await respond(update, f"✅ Set weekly withdrawal allowance for <b>{ui.esc(target.get('first_name') or target.get('username') or target['user_id'])}</b> to <b>{ui.fmt(amount)}</b>.")
+        return
+    if sub == "withdraw":
+        if len(rest) < 2 or rest[0].lower() not in ("yens", "gems", "crystals") or not rest[1].isdigit():
+            await respond(update, "Usage: /clan withdraw &lt;yens|gems|crystals&gt; &lt;amount&gt;")
+            return
+        result = db.clan_withdraw(update.effective_user.id, rest[0].lower(), int(rest[1]))
+        if not result.get("ok"):
+            await respond(update, f"❌ {ui.esc(result.get('reason', 'Withdrawal failed.'))}")
+            return
+        await respond(update, f"✅ Withdrew <b>{ui.fmt(result['amount'])} {result['currency']}</b> from the clan treasury.")
+        return
     if sub == "announce":
         result = db.clan_announce(update.effective_user.id, " ".join(rest))
         await respond(update, "📢 Announcement updated." if result["ok"] else f"❌ {ui.esc(result['reason'])}")
@@ -2506,7 +3315,6 @@ async def cmd_titles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for title_id, title in data.TITLES.items():
         if title_id in unlocked:
             rows.append([InlineKeyboardButton(("✅ " if player.get("title") == title_id else "🏷️ ") + title["name"], callback_data=f"title:equip:{title_id}")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -2529,33 +3337,35 @@ async def market_view(update: Update, context: ContextTypes.DEFAULT_TYPE, page: 
     if player is None:
         return
     db = get_db(context)
+    per_page = 6
     page = max(1, int(page))
-    listings = db.market_listings(10, (page - 1) * 10)
+    listings = db.market_listings(per_page, (page - 1) * per_page)
     total = db.market_count()
-    lines = [f"🏪 <b>MARKET</b> — {total} listings", ""]
+    pages = max(1, (total + per_page - 1) // per_page)
+    lines = [f"🏪 <b>MARKET</b> • Page {page}/{pages} • {total} listings", ""]
     if not listings:
         lines.append("No listings yet. Use /market_sell to list an item.")
-    for listing in listings:
+    for index, listing in enumerate(listings, (page - 1) * per_page + 1):
         meta = f" Lv.{listing['meta'].get('level')}" if listing["kind"] == "gear" else ""
+        seller = listing.get("first_name") or listing.get("username") or "Summoner"
         lines.append(
-            f"#{listing['id']} {listing['emoji']} <b>{ui.esc(listing['name'])}</b>{meta} x{listing['qty']} — 💠 {ui.fmt(listing['price'])} yens\n"
-            f"   Seller: {ui.esc(listing.get('first_name') or listing.get('username') or 'Summoner')}"
+            f"{index}. {listing['emoji']} <b>{ui.esc(listing['name'])}</b>{meta} x{listing['qty']} — 💠 {ui.fmt(listing['price'])} • {ui.esc(seller)}"
         )
-    lines.extend(["", "Buy: /market_buy &lt;id&gt; • Cancel: /market_cancel &lt;id&gt;", "Sell: /market_sell &lt;item_id&gt; &lt;qty&gt; &lt;price&gt;"])
+    lines.extend(["", "Tap a listing to buy or cancel. Sell with /market_sell."])
     rows = []
-    for listing in listings[:8]:
+    for listing in listings:
+        label = f"#{listing['id']} {listing['emoji']} {listing['name']} — {ui.fmt(listing['price'])}"
         if int(listing["seller_id"]) == int(update.effective_user.id):
-            rows.append([InlineKeyboardButton(f"❌ Cancel #{listing['id']} {listing['name']}", callback_data=f"market:cancel:{listing['id']}")])
+            rows.append([InlineKeyboardButton(f"❌ {label}", callback_data=f"market:cancel:{listing['id']}")])
         else:
-            rows.append([InlineKeyboardButton(f"🛒 Buy #{listing['id']} {listing['name']} — {ui.fmt(listing['price'])} yens", callback_data=f"market:buy:{listing['id']}")])
+            rows.append([InlineKeyboardButton(f"🛒 {label}", callback_data=f"market:buy:{listing['id']}")])
     buttons = []
     if page > 1:
         buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"market:{page - 1}"))
-    if page * 10 < total:
+    if page < pages:
         buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"market:{page + 1}"))
     if buttons:
         rows.append(buttons)
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -2650,7 +3460,6 @@ async def travel_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for series in data.SERIES_ORDER:
         info = data.SERIES[series]
         rows.append([InlineKeyboardButton(f"{info['emoji']} {info['name']} — {info['home']}", callback_data=f"travel:{series}")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -2659,8 +3468,8 @@ async def cmd_series(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for series in data.SERIES_ORDER:
         info = data.SERIES[series]
         total = len(data.CHARACTERS_BY_SERIES[series])
-        lines.append(f"{info['emoji']} <b>{info['name']}</b> — {total} heroes\n   Home: {info['home']}\n   {info['lore']}\n")
-    lines.append("Set your home world with /travel &lt;series&gt;.")
+        lines.append(f"{info['emoji']} <b>{info['name']}</b> — {total} heroes • {ui.esc(info['home'])}")
+    lines.append("\nSet your home world with /travel &lt;series&gt;.")
     await respond(update, "\n".join(lines), ui.series_keyboard("seriesinfo", include_all=False))
 
 
@@ -2738,7 +3547,6 @@ async def pets_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         InlineKeyboardButton("×50 (50,000💎)", callback_data="petsummon:50"),
     ])
     rows.append([InlineKeyboardButton("🥚 Hatch Egg", callback_data="pet:hatch:pet_egg"), InlineKeyboardButton("🌟 Hatch Premium", callback_data="pet:hatch:pet_egg_premium")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -2941,7 +3749,7 @@ async def pet_summon_result(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     pet = best["pet"]
     await respond(update, "\n".join(lines), InlineKeyboardMarkup([
         [InlineKeyboardButton("🌟 Summon ×1 (1,000💎)", callback_data="petsummon:1"), InlineKeyboardButton("×10 (10,000💎)", callback_data="petsummon:10"), InlineKeyboardButton("×50 (50,000💎)", callback_data="petsummon:50")],
-        [InlineKeyboardButton("🐾 Pets", callback_data="menu:pets"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+        [InlineKeyboardButton("🐾 Pets", callback_data="menu:pets")],
     ]))
 
 
@@ -3166,7 +3974,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if trade:
         rows.append([InlineKeyboardButton("🤝 View Trade", callback_data=f"trade:view:{trade['id']}")])
     rows.append([InlineKeyboardButton("👤 Profile", callback_data="menu:profile"), InlineKeyboardButton("🏆 Rankings", callback_data="menu:leaderboard")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -3218,6 +4025,77 @@ async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await respond(update, "\n".join(lines), ui.back_keyboard("menu:profile"))
 
 
+def admin_panel_text(db: Database) -> str:
+    stats = db.query_stats()
+    return (
+        "🛠 <b>ADMIN CONTROL PANEL</b>\n\n"
+        f"👥 Players: <b>{db.player_count()}</b> • 🏯 Clans: <b>{len(db.clan_leaderboard(999))}</b>\n"
+        f"🎫 Queries: <b>{stats.get('open', 0)}</b> open • <b>{stats.get('answered', 0)}</b> answered\n"
+        f"🛡 Admins: <b>{len(db.admins())}</b> dynamic + <b>{len(config.OWNER_IDS)}</b> owners\n\n"
+        "<b>➕ GRANT</b>\n"
+        "/admin add &lt;user&gt; &lt;kind&gt; &lt;value&gt; [qty]\n"
+        "Kinds: yens, gems, crystals, tickets, stamina, skill_points, exp, level, character, gear, item, pet, shard, title, everything\n\n"
+        "<b>➖ REMOVE / SET</b>\n"
+        "/admin remove &lt;user&gt; &lt;kind&gt; &lt;value&gt; [qty]\n"
+        "/admin set &lt;user&gt; &lt;yens|gems|crystals|tickets|stamina|skill_points|level|exp&gt; &lt;value&gt;\n\n"
+        "<b>🛡 MODERATION</b>\n"
+        "/admin heal|ban|unban|reset &lt;user&gt; • /setlevel &lt;user&gt; &lt;level&gt;\n\n"
+        "<b>🛡 ADMIN TEAM (OWNER)</b>\n"
+        "/admin admins • /admin addadmin &lt;user&gt; • /admin removeadmin &lt;user&gt;\n\n"
+        "<i>Targets work with numeric IDs, @usernames, or by replying to a player.</i>"
+    )
+
+
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎫 Queries", callback_data="admin:queries"), InlineKeyboardButton("🛡 Admins", callback_data="admin:admins")],
+        [InlineKeyboardButton("📊 Refresh", callback_data="admin:menu"), InlineKeyboardButton("💾 Backup", callback_data="admin:backup")],
+        [InlineKeyboardButton("📢 Broadcast Help", callback_data="admin:broadcast"), InlineKeyboardButton("❌ Close", callback_data="menu:main")],
+    ])
+
+
+async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]) -> None:
+    db = get_db(context)
+    action = parts[1] if len(parts) > 1 else "menu"
+    if action == "menu":
+        await respond(update, admin_panel_text(db), admin_panel_keyboard())
+        return
+    if action == "queries":
+        context.args = ["list"]
+        await cmd_admin_query(update, context)
+        return
+    if action == "backup":
+        context.args = []
+        await cmd_backup(update, context)
+        return
+    if action == "broadcast":
+        await respond(update, "📢 <b>BROADCAST</b>\n\nUse <code>/broadcast your message</code> to DM every player.", ui.back_keyboard("admin:menu"))
+        return
+    if action == "admins":
+        owners = [str(uid) for uid in config.OWNER_IDS]
+        dynamic = [str(uid) for uid in db.admins()]
+        await respond(update, "🛡 <b>ADMIN TEAM</b>\n\n"
+                        f"👑 Owners: <code>{', '.join(owners) or 'None'}</code>\n"
+                        f"🛠 Dynamic: <code>{', '.join(dynamic) or 'None'}</code>\n\n"
+                        "Owner tools:\n/admin addadmin &lt;id|@user&gt;\n/admin removeadmin &lt;id|@user&gt;", ui.back_keyboard("admin:menu"))
+        return
+    await respond(update, admin_panel_text(db), admin_panel_keyboard())
+
+
+async def _admin_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    db = get_db(context)
+    reply = replied_user(update)
+    if reply is not None:
+        return db.ensure_player(reply.id, reply.username, reply.first_name)
+    args = list(context.args)
+    if not args:
+        return None
+    raw = args[0].strip()
+    if raw.lstrip("@").isdigit():
+        return db.ensure_player(int(raw.lstrip("@")))
+    return db.find_player(raw)
+
+
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     player = await guard_admin(update, context)
     if player is None:
@@ -3235,6 +4113,9 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if sub == "set":
             await cmd_admin_set(update, context)
             return
+        if sub in ("query", "queries", "tickets", "reports"):
+            await cmd_admin_query(update, context)
+            return
         if sub == "heal":
             await cmd_admin_heal(update, context)
             return
@@ -3247,39 +4128,48 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if sub == "reset":
             await cmd_resetplayer(update, context)
             return
+        if sub in ("admins", "adminlist", "team"):
+            db = get_db(context)
+            owners = [str(uid) for uid in config.OWNER_IDS]
+            dynamic = [str(uid) for uid in db.admins()]
+            await respond(update, "🛡 <b>ADMIN TEAM</b>\n\n"
+                            f"👑 Owners: <code>{', '.join(owners) or 'None'}</code>\n"
+                            f"🛠 Admins: <code>{', '.join(dynamic) or 'None'}</code>\n\n"
+                            "Owner tools:\n/admin addadmin &lt;id|@user&gt;\n/admin removeadmin &lt;id|@user&gt;", ui.back_keyboard("admin:menu"))
+            return
+        if sub in ("addadmin", "promote"):
+            if not config.is_admin(update.effective_user.id):
+                await respond(update, "⛔ Owner only.")
+                return
+            target = await _admin_target(update, context)
+            if target is None:
+                await respond(update, "Usage: /admin addadmin &lt;id|@user&gt; or reply to a player.")
+                return
+            db = get_db(context)
+            if db.is_admin(int(target["user_id"])):
+                await respond(update, "ℹ️ That player is already an admin.")
+                return
+            db.add_admin(int(target["user_id"]), update.effective_user.id)
+            await respond(update, f"✅ <b>{ui.esc(display_name(target))}</b> is now an admin.")
+            return
+        if sub in ("removeadmin", "demote"):
+            if not config.is_admin(update.effective_user.id):
+                await respond(update, "⛔ Owner only.")
+                return
+            target = await _admin_target(update, context)
+            if target is None:
+                await respond(update, "Usage: /admin removeadmin &lt;id|@user&gt; or reply to a player.")
+                return
+            target_id = int(target["user_id"])
+            if target_id in config.OWNER_IDS:
+                await respond(update, "⛔ Owners cannot be removed here.")
+                return
+            removed = get_db(context).remove_admin(target_id)
+            await respond(update, "✅ Admin removed." if removed else "ℹ️ That player is not a dynamic admin.")
+            return
         await respond(update, f"❌ Unknown admin subcommand <b>{ui.esc(sub)}</b>. Opening the panel.", ui.back_keyboard())
     db = get_db(context)
-    text = (
-        "🛠 <b>ADMIN CONTROL PANEL</b>\n\n"
-        f"👥 Players: <b>{db.player_count()}</b>\n"
-        f"🎴 Characters owned: <b>{sum(len(db.characters(row['user_id'])) for row in db.all_players(500))}</b>\n"
-        f"🏯 Clans: <b>{len(db.clan_leaderboard(999))}</b>\n\n"
-        "<b>➕ ADD / GRANT</b>\n"
-        "/admin add &lt;user&gt; &lt;kind&gt; &lt;id|amount&gt; [qty]\n"
-        "   Kinds: yens, gems, crystals, tickets, stamina, skill_points, exp, level,\n"
-        "   character, gear, item, pet, shard, title, everything\n"
-        "Examples:\n"
-        "• /admin add @user yens 50000\n"
-        "• /admin add 123456789 character goku\n"
-        "• /admin add @user gear gear_pull_db_weapon_01\n\n"
-        "<b>➖ REMOVE / TAKE</b>\n"
-        "/admin remove &lt;user&gt; &lt;kind&gt; &lt;id|amount&gt; [qty]\n"
-        "   Kinds: yens, gems, crystals, tickets, stamina, skill_points, exp,\n"
-        "   character, gear, item, pet, shard, title\n"
-        "Examples:\n"
-        "• /admin remove @user yens 25000\n"
-        "• /admin remove 123456789 character goku\n"
-        "• /admin remove @user item senzu 5\n\n"
-        "<b>🎚 SET EXACT VALUES</b>\n"
-        "/admin set &lt;user&gt; &lt;yens|gems|crystals|tickets|stamina|skill_points|level|exp&gt; &lt;value&gt;\n"
-        "Example: /admin set @user gems 1000\n\n"
-        "<b>🛡 MODERATION</b>\n"
-        "/admin heal &lt;user&gt; • /admin ban &lt;user&gt; • /admin unban &lt;user&gt;\n"
-        "/admin reset &lt;user&gt; • /setlevel &lt;user&gt; &lt;level&gt;\n"
-        "/broadcast &lt;text&gt; • /backup • /upload TYPE NAME\n\n"
-        "<i>Targets work with numeric IDs, @usernames, or by replying to a player.</i>"
-    )
-    await respond(update, text, ui.back_keyboard())
+    await respond(update, admin_panel_text(db), admin_panel_keyboard())
 
 
 async def cmd_give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3584,6 +4474,119 @@ async def cmd_admin_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await respond(update, f"🎚 <b>{ui.esc(result_text)}</b>\nTarget: <b>{ui.esc(display_name(target))}</b>\n{note}")
 
 
+def query_ticket_text(ticket: dict, db: Database | None = None) -> str:
+    emoji, label = QUERY_CATEGORIES.get(ticket.get("category", "bug"), ("📝", "Query"))
+    status_emoji = {"open": "🟡", "answered": "🔵", "closed": "✅"}.get(ticket.get("status"), "⚪")
+    created = datetime.fromtimestamp(int(ticket.get("created_at", 0))).strftime("%Y-%m-%d %H:%M")
+    reporter = query_reporter_text(db, ticket) if db is not None else (
+        f"👤 {ui.esc(ticket.get('display_name') or 'Unknown')} • {ui.esc(ticket.get('username') or 'N/A')} • <code>{ticket['user_id']}</code>\n"
+        f"💬 Chat ID: <code>{int(ticket.get('chat_id') or 0)}</code>"
+    )
+    lines = [
+        f"{emoji} <b>{ticket['code']}</b> • {status_emoji} {ui.esc(str(ticket.get('status', 'open')).title())}",
+        f"📂 {label} • 🕒 {created}",
+        reporter,
+        "",
+        f"📝 <b>Report</b>\n{ui.esc(ticket['query_text'])}",
+    ]
+    if ticket.get("admin_reply"):
+        lines.extend(["", f"💬 <b>Admin reply:</b> {ui.esc(ticket['admin_reply'])}"])
+    return "\n".join(lines)
+
+
+async def cmd_admin_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    admin = await guard_admin(update, context)
+    if admin is None:
+        return
+    db = get_db(context)
+    args = list(context.args)
+    action = args[0].lower() if args else "list"
+    if action in ("list", "open", "closed", "all"):
+        status = "open" if action == "list" else action
+        tickets = db.queries(status, 30)
+        stats = db.query_stats()
+        lines = [
+            "🎫 <b>QUERY DESK</b>",
+            f"🟡 Open: {stats.get('open', 0)} • 🔵 Answered: {stats.get('answered', 0)} • ✅ Closed: {stats.get('closed', 0)}",
+            "",
+        ]
+        if not tickets:
+            lines.append("No queries in this view.")
+        for ticket in tickets:
+            emoji, label = QUERY_CATEGORIES.get(ticket.get("category", "bug"), ("📝", "Query"))
+            preview = ticket["query_text"].replace("\n", " ")
+            if len(preview) > 80:
+                preview = preview[:77] + "..."
+            lines.append(f"{emoji} <b>{ticket['code']}</b> [{ticket['status']}] {label} — {ui.esc(ticket.get('display_name') or ticket['user_id'])}\n   {ui.esc(preview)}")
+        lines.extend(["", "View: /admin query view &lt;id&gt;\nReply: /admin query reply &lt;id&gt; &lt;text&gt;\nClose: /admin query close &lt;id&gt; [note]"])
+        await respond(update, "\n".join(lines), ui.back_keyboard())
+        return
+    if action in ("view", "show", "info") or db._parse_query_id(action) is not None:
+        query_id = args[1] if action in ("view", "show", "info") and len(args) > 1 else action
+        ticket = db.query_get(query_id)
+        if ticket is None:
+            await respond(update, "❌ Query not found.")
+            return
+        await respond(update, query_ticket_text(ticket, db), ui.back_keyboard())
+        return
+    if action == "reply":
+        if len(args) < 3:
+            await respond(update, "Usage: /admin query reply &lt;id&gt; &lt;message&gt;")
+            return
+        ticket = db.query_get(args[1])
+        if ticket is None:
+            await respond(update, "❌ Query not found.")
+            return
+        reply = " ".join(args[2:]).strip()
+        result = db.query_update(ticket["id"], status="answered", reply=reply, handled_by=admin["user_id"])
+        if not result.get("ok"):
+            await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not update query.'))}")
+            return
+        notified = await notify_user(
+            context,
+            int(ticket["user_id"]),
+            f"💬 <b>REPLY TO QUERY {ticket['code']}</b>\n\n"
+            f"📝 Your report: {ui.esc(ticket['query_text'])}\n\n"
+            f"🛠 Admin reply:\n{ui.esc(reply)}\n\n"
+            "Use /query to send another report.",
+            ui.back_keyboard("menu:main"),
+        )
+        note = "Player notified in DM." if notified else "Player must start the bot once to receive DM notifications."
+        await respond(update, f"✅ Replied to <b>{ticket['code']}</b>.\n{note}")
+        return
+    if action in ("close", "resolve", "done"):
+        if len(args) < 2:
+            await respond(update, "Usage: /admin query close &lt;id&gt; [note]")
+            return
+        ticket = db.query_get(args[1])
+        if ticket is None:
+            await respond(update, "❌ Query not found.")
+            return
+        note_text = " ".join(args[2:]).strip()
+        result = db.query_update(ticket["id"], status="closed", reply=note_text or ticket.get("admin_reply") or None, handled_by=admin["user_id"])
+        if not result.get("ok"):
+            await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not close query.'))}")
+            return
+        message = f"✅ <b>QUERY {ticket['code']} CLOSED</b>"
+        if note_text:
+            message += f"\n💬 {ui.esc(note_text)}"
+        await notify_user(context, int(ticket["user_id"]), message + "\n\nThanks for helping improve the game.", ui.back_keyboard("menu:main"))
+        await respond(update, f"✅ Closed <b>{ticket['code']}</b>.")
+        return
+    if action == "reopen":
+        if len(args) < 2:
+            await respond(update, "Usage: /admin query reopen &lt;id&gt;")
+            return
+        ticket = db.query_get(args[1])
+        if ticket is None:
+            await respond(update, "❌ Query not found.")
+            return
+        db.query_update(ticket["id"], status="open", handled_by=admin["user_id"])
+        await respond(update, f"🟡 Reopened <b>{ticket['code']}</b>.")
+        return
+    await respond(update, "Usage: /admin queries [open|closed|all] • /admin query view &lt;id&gt; • /admin query reply &lt;id&gt; &lt;text&gt; • /admin query close &lt;id&gt; [note]")
+
+
 def _offer_label(db: Database, trade: dict, side: str, offer: dict) -> str:
     kind = offer["kind"]
     qty = int(offer.get("qty", 1))
@@ -3844,14 +4847,31 @@ async def cmd_skillshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if player is None:
         return
     series = parse_series(context.args[0]) if context.args else player.get("travel", "dragonball")
-    rows = game.skill_shop(series)
-    lines = [f"🧠 <b>SKILL SHOP — {series_name(series)}</b>", f"Skill points: {player['skill_points']} • Buy with /skillbuy &lt;skill_id&gt;", ""]
-    keyboard_rows = []
+    page = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else 1
+    all_rows = game.skill_shop(series)
+    per_page = 8
+    total_pages = max(1, (len(all_rows) + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    rows = all_rows[(page - 1) * per_page:page * per_page]
+    lines = [
+        f"🧠 <b>SKILL SHOP — {series_name(series)}</b>",
+        f"🧠 {player['skill_points']} SP • Page {page}/{total_pages} • Use /skillbuy &lt;id&gt;",
+        "",
+    ]
+    skill_buttons = []
     for row in rows:
         skill = row["skill"]
-        lines.append(f"• <b>{ui.esc(skill['name'])}</b> — {ui.fmt(row['cost'])} {row['currency']} • power x{skill['power']}\n   <code>{skill['id']}</code> • {ui.esc(skill['description'])}")
-        keyboard_rows.append([InlineKeyboardButton(f"🛒 Buy {skill['name']} — {ui.fmt(row['cost'])} {row['currency']}", callback_data=f"skill:buy:{skill['id']}")])
-    keyboard_rows.append([InlineKeyboardButton("🧠 My Skills", callback_data="menu:skills"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+        lines.append(f"{data.ELEMENTS.get(skill.get('element'), {}).get('emoji', '🔹')} <b>{ui.esc(skill['name'])}</b> — {ui.fmt(row['cost'])} {row['currency']} • x{skill['power']} • <code>{skill['id']}</code>")
+        skill_buttons.append(InlineKeyboardButton(f"🛒 {skill['name']} • {ui.fmt(row['cost'])}", callback_data=f"skill:buy:{skill['id']}"))
+    keyboard_rows = [skill_buttons[index:index + 2] for index in range(0, len(skill_buttons), 2)]
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"skillshop:{series}:{page - 1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"skillshop:{series}:{page + 1}"))
+    if nav:
+        keyboard_rows.append(nav)
+    keyboard_rows.append([InlineKeyboardButton("🧠 My Skills", callback_data="menu:skills")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(keyboard_rows))
 
 
@@ -3869,6 +4889,34 @@ async def cmd_skillbuy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await respond(update, f"✅ Learned <b>{ui.esc(result['skill']['name'])}</b> for {ui.fmt(result['cost'])} {result['currency']}!\nUse /skill_equip {result['skill']['id']} to equip it.")
 
 
+async def summonboss_view(update: Update, context: ContextTypes.DEFAULT_TYPE, series: str | None = None) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    lines = [
+        "🌌 <b>SUMMON BOSS</b>",
+        f"🎟️ Tickets: {player['tickets']} • 💎 Gems: {ui.fmt(player['gems'])} • ⚡ Stamina: {player['stamina']}",
+        "Cost: 1 ticket, or 15 gems, or 20 stamina.",
+        "",
+    ]
+    rows = []
+    if series in data.SERIES:
+        info = data.SERIES[series]
+        lines.append(f"{info['emoji']} <b>{ui.esc(info['home'])}</b>")
+        for boss in data.SUMMON_BOSSES_BY_SERIES.get(series, [])[:8]:
+            lines.append(f"• <b>{ui.esc(boss['name'])}</b> Lv.{boss['level']} • {data.ELEMENTS[boss['element']]['emoji']} • {ui.fmt(boss['hp'])} HP")
+            rows.append([InlineKeyboardButton(f"🌌 Summon {boss['name']}", callback_data=f"summonboss:start:{boss['id']}")])
+        rows.append([InlineKeyboardButton("🎲 Random In World", callback_data=f"summonboss:start:random:{series}")])
+        rows.append([InlineKeyboardButton("🌐 Change World", callback_data="summonboss:view:all")])
+    else:
+        lines.append("Choose a world, then pick a boss or summon a random one.")
+        buttons = [InlineKeyboardButton(f"{data.SERIES[key]['emoji']} {data.SERIES[key]['short']}", callback_data=f"summonboss:view:{key}") for key in data.SERIES_ORDER]
+        for index in range(0, len(buttons), 2):
+            rows.append(buttons[index:index + 2])
+        rows.append([InlineKeyboardButton("🎲 Random Anywhere", callback_data="summonboss:start:random")])
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
 async def cmd_summonboss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = list(context.args)
     series = None
@@ -3879,7 +4927,10 @@ async def cmd_summonboss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             series = possible
         else:
             boss_id = args[0]
-    await start_battle(update, context, "summon", series=series, boss_id=boss_id)
+    if boss_id:
+        await start_battle(update, context, "summon", series=series, boss_id=boss_id)
+        return
+    await summonboss_view(update, context, series)
 
 
 async def cmd_summonattack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4068,7 +5119,7 @@ async def cmd_explore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lines.append("\nTap Hunt Preview to inspect an enemy and choose Battle or Flee.")
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚔️ Hunt Preview", callback_data=f"hunt:reroll:{series}"), InlineKeyboardButton("🗺️ NPC List", callback_data="menu:npc")],
-        [InlineKeyboardButton("🌍 Travel", callback_data="menu:travel"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+        [InlineKeyboardButton("🌍 Travel", callback_data="menu:travel")],
     ])
     await respond(update, "\n".join(lines), keyboard)
 
@@ -4099,7 +5150,7 @@ async def cmd_heal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db = get_db(context)
     db.refresh_stamina(update.effective_user.id)
     rows = [[InlineKeyboardButton(f"{item['emoji']} Use {item['name']} x{item['qty']}", callback_data=f"heal:use:{item['item_id']}")] for item in battle.potions(db, update.effective_user.id)[:4]]
-    rows.append([InlineKeyboardButton("🛒 Potions Shop", callback_data="shop:potions"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    rows.append([InlineKeyboardButton("🛒 Potions Shop", callback_data="shop:potions")])
     await respond(update, heal_text(db, update.effective_user.id), InlineKeyboardMarkup(rows))
 
 
@@ -4125,7 +5176,7 @@ async def cmd_stamina(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         lines.append("No stamina items. Buy them from the shop below.")
     lines.append("\nShop: /shop potions — Stamina Drink, Stamina Crystal, Feast of Tempest.")
-    rows.append([InlineKeyboardButton("🛒 Buy Stamina Items", callback_data="shop:potions"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    rows.append([InlineKeyboardButton("🛒 Buy Stamina Items", callback_data="shop:potions")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -4143,7 +5194,7 @@ async def cmd_pity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Pity carries across banners. Summon with /gacha or the buttons below.",
     ]
     await respond(update, "\n".join(lines), InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎴 Summon Banners", callback_data="menu:gacha"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+        [InlineKeyboardButton("🎴 Summon Banners", callback_data="menu:gacha")],
     ]))
 
 
@@ -4250,13 +5301,11 @@ async def cmd_crown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             callback_data=f"crown:clan:{item['tag']}",
         )])
     rows.append([InlineKeyboardButton("🏯 Clan Menu", callback_data="menu:clan"), InlineKeyboardButton("🎴 Heroes", callback_data="chars:all:all:1")])
-    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def crown_art_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not config.is_admin(update.effective_user.id if update.effective_user else None):
-        await respond(update, "🔒 Custom art tools are available to admins only.")
+    if not get_db(context).is_admin(update.effective_user.id if update.effective_user else None):
         return
     player = await guard(update, context)
     if player is None:
@@ -4286,7 +5335,7 @@ async def crown_art_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     rows = []
     for index in range(0, len(art_buttons), 2):
         rows.append(art_buttons[index:index + 2])
-    rows.append([InlineKeyboardButton("⬅️ Crown Art", callback_data="crownart:view"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    rows.append([InlineKeyboardButton("⬅️ Crown Art", callback_data="crownart:view")])
     await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
@@ -4366,6 +5415,73 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
+STARTUP_WELCOME = """<b>⚡ ULTIMATE ⚡</b>
+
+👋 <b>Welcome back, {name}!</b>
+
+━━━━━━━━━━━━━━━━━━
+📊 <b>Your status</b>
+├ 🏅 Rank: <b>{rank}</b>
+├ 💪 Power: <b>{power:,}</b>
+├ 💰 Yens: <b>{coins:,}</b>
+├ 💎 Gems: <b>{gems:,}</b>
+├ ⚡ Stamina: <b>{energy}/{energy_max}</b>
+└ 🐉 Heroes: <b>{owned}/{total}</b>
+━━━━━━━━━━━━━━━━━━
+
+🎯 <b>Pick up where you left off</b>
+├ <code>/hunt</code> — fight NPCs
+├ <code>/dungeon</code> — climb floors
+├ <code>/raid</code> — world boss
+└ <code>/daily</code> — claim your streak
+
+🔥 <i>Every return makes you stronger.</i>"""
+
+
+async def _startup_welcome_broadcast(application: Application) -> None:
+    db = application.bot_data.get("db")
+    if db is None:
+        return
+    await asyncio.sleep(2)
+    sent = failed = 0
+    for player in db.all_players(0):
+        user_id = int(player.get("user_id", 0) or 0)
+        if user_id <= 0:
+            continue
+        try:
+            stats = game.effective_stats(db, user_id)
+            power = game.power_score(stats)
+        except Exception:
+            power = 0
+        text = STARTUP_WELCOME.format(
+            name=ui.esc(display_name(player)),
+            rank=ui.esc(player.get("rank", "Rookie")),
+            power=int(power),
+            coins=int(player.get("yens", 0) or 0),
+            gems=int(player.get("gems", 0) or 0),
+            energy=int(player.get("stamina", 0) or 0),
+            energy_max=int(player.get("max_stamina", 0) or 0),
+            owned=len(db.characters(user_id)),
+            total=len(data.CHARACTERS),
+        )
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Open Menu", callback_data="menu:main")]]),
+            )
+            sent += 1
+        except RetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 1)
+            failed += 1
+        except TelegramError:
+            failed += 1
+        await asyncio.sleep(0.05)
+    logger.info("Startup welcome sent: %s delivered, %s failed", sent, failed)
+
+
 async def post_init(application: Application) -> None:
     db = Database(config.DB_PATH)
     application.bot_data["db"] = db
@@ -4380,10 +5496,11 @@ async def post_init(application: Application) -> None:
         except TelegramError as exc:
             logger.warning("Could not set public commands (attempt %d): %s", attempt + 1, exc)
             await asyncio.sleep(2)
-    if config.ADMIN_IDS:
+    admin_ids = list(dict.fromkeys([*config.ADMIN_IDS, *db.admins()]))
+    if admin_ids:
         admin_commands = public_commands + [BotCommand(name, desc) for name, desc in ADMIN_COMMANDS]
         admin_commands = admin_commands[:100]
-        for admin_id in config.ADMIN_IDS:
+        for admin_id in admin_ids:
             for attempt in range(3):
                 try:
                     await application.bot.set_my_commands(
@@ -4395,6 +5512,7 @@ async def post_init(application: Application) -> None:
                 except TelegramError as exc:
                     logger.warning("Could not set admin commands for %s (attempt %d): %s", admin_id, attempt + 1, exc)
                     await asyncio.sleep(2)
+    application.create_task(_startup_welcome_broadcast(application))
     username = application.bot.username or "unknown"
     logger.info("Connected to Telegram as @%s", username)
 
@@ -4417,6 +5535,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("status", "Account overview and active actions"),
     ("search", "Search heroes, gear, items, pets, skills"),
     ("compare", "Compare your progress with another player"),
+    ("query", "Report a bug, glitch, flaw or suggestion"),
     ("register", "Choose your home series"),
     ("characters", "Browse your heroes"),
     ("character", "Inspect a hero"),
@@ -4459,20 +5578,11 @@ COMMANDS: list[tuple[str, str]] = [
     ("duel", "Challenge a player"),
     ("leaderboard", "Player, arena, clan and raid rankings"),
     ("clan", "Clan menu and actions"),
-    ("clan_create", "Create a clan"),
     ("clan_join", "Join a clan"),
-    ("clan_leave", "Leave your clan"),
+    ("clan_info", "Clan details and treasury"),
     ("pity", "Gacha pity progress"),
-    ("clan_donate", "Donate to your clan"),
-    ("clan_kick", "Kick a clan member"),
-    ("clan_promote", "Promote a member"),
     ("element", "Element strengths and weaknesses"),
-    ("clan_announce", "Set clan announcement"),
-    ("clan_disband", "Disband your clan"),
-    ("clan_invite", "Invite a player to your clan"),
     ("unstuck", "Clear stuck battles and restore HP"),
-    ("clan_accept", "Accept a clan invite"),
-    ("clan_transfer", "Transfer clan leadership"),
     ("quests", "Quest log"),
     ("claim", "Claim quest rewards"),
     ("achievements", "Achievement log"),
@@ -4508,7 +5618,6 @@ ADMIN_COMMANDS: list[tuple[str, str]] = [
     ("admin", "Admin panel: add, remove, set, moderate"),
     ("grant", "Admin: grant any asset"),
     ("ban", "Admin: ban player"),
-    ("setlevel", "Admin: set player level"),
     ("broadcast", "Admin: broadcast"),
     ("backup", "Admin: backup database"),
 ]
@@ -4531,6 +5640,9 @@ HANDLERS = {
     "stats": cmd_profile,
     "search": cmd_search,
     "find": cmd_search,
+    "query": cmd_query,
+    "report": cmd_query,
+    "bugreport": cmd_query,
     "status": cmd_status,
     "overview": cmd_status,
     "compare": cmd_compare,
@@ -4701,6 +5813,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     payload = query.data or ""
     parts = payload.split(":")
     key = parts[0]
+    if key in ("admin", "art", "crownart") and not get_db(context).is_admin(update.effective_user.id if update.effective_user else None):
+        return
+    if key == "admin":
+        await handle_admin_callback(update, context, parts)
+        return
+    if key == "skillshop":
+        context.args = [parts[1], parts[2]] if len(parts) > 2 and parts[2].isdigit() else [parts[1]]
+        await cmd_skillshop(update, context)
+        return
+    if key == "duel":
+        await handle_duel_callback(update, context, parts)
+        return
     if key == "trade":
         await handle_trade_callback(update, context, parts)
         return
@@ -4743,6 +5867,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         elif target == "skillshop":
             context.args = []
             await cmd_skillshop(update, context)
+        elif target == "gear":
+            context.args = []
+            await cmd_gear(update, context)
+        elif target == "duel":
+            context.args = []
+            await cmd_duel(update, context)
         elif target == "fish":
             await cmd_fish(update, context)
         elif target == "mine":
@@ -4797,6 +5927,35 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         count = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
         await do_equipment_pull(update, context, series, count)
         return
+    if key == "elite":
+        action = parts[1] if len(parts) > 1 else "view"
+        if action == "view":
+            series = parts[2] if len(parts) > 2 and parts[2] in data.SERIES else None
+            await elite_view(update, context, series)
+        elif action == "start":
+            series = parts[2] if len(parts) > 2 and parts[2] in data.SERIES else None
+            await start_battle(update, context, "elite", series=series)
+        return
+    if key == "arena":
+        action = parts[1] if len(parts) > 1 else "view"
+        if action == "fight" and len(parts) > 2 and parts[2].isdigit():
+            await start_battle(update, context, "duel", opponent_id=int(parts[2]), arena=True)
+        else:
+            await arena_view(update, context)
+        return
+    if key == "summonboss":
+        action = parts[1] if len(parts) > 1 else "view"
+        if action == "view":
+            series = parts[2] if len(parts) > 2 and parts[2] in data.SERIES else None
+            await summonboss_view(update, context, series)
+        elif action == "start":
+            target = parts[2] if len(parts) > 2 else "random"
+            if target != "random":
+                await start_battle(update, context, "summon", boss_id=target)
+            else:
+                series = parts[3] if len(parts) > 3 and parts[3] in data.SERIES else None
+                await start_battle(update, context, "summon", series=series)
+        return
     if key == "shop":
         action = parts[1] if len(parts) > 1 else "all"
         if action == "item" and len(parts) > 2:
@@ -4848,6 +6007,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         action = parts[1] if len(parts) > 1 else "view"
         db = get_db(context)
+        if action == "tab":
+            category = parts[2] if len(parts) > 2 and parts[2] in ("items", "gear", "pets") else "items"
+            page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
+            await inventory_view(update, context, category, page)
+            return
         if action == "use" and len(parts) > 2:
             result = game.use_item(db, update.effective_user.id, parts[2], 1)
             if not result["ok"]:
@@ -5022,11 +6186,27 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             result = db.clan_donate(update.effective_user.id, currency, int(amount_text))
             await respond(update, f"✅ Donated {ui.fmt(result['amount'])} {currency}." if result["ok"] else f"❌ {ui.esc(result['reason'])}", ui.back_keyboard("clan:treasury"))
             return
+        if action == "withdraw" and len(parts) > 3 and parts[2] in ("yens", "gems", "crystals") and parts[3].isdigit():
+            result = db.clan_withdraw(update.effective_user.id, parts[2], int(parts[3]))
+            await respond(update, f"✅ Withdrew {ui.fmt(result['amount'])} {result['currency']}." if result["ok"] else f"❌ {ui.esc(result['reason'])}", ui.back_keyboard("clan:treasury"))
+            return
         if action == "treasury":
             await clan_treasury_view(update, context)
             return
         if action in ("members", "member"):
             await clan_members_view(update, context)
+            return
+        if action == "manage" and len(parts) > 2 and parts[2] == "toggle_join":
+            clan = db.clan(update.effective_user.id)
+            info = db.clan_info(clan["id"]) if clan else None
+            if info is None:
+                await respond(update, "❌ You are not in a clan.", ui.back_keyboard("menu:clan"))
+                return
+            result = db.clan_settings(update.effective_user.id, open_join=not bool(info.get("open_join", 1)))
+            if not result.get("ok"):
+                await respond(update, f"❌ {ui.esc(result.get('reason', 'Could not update join settings.'))}", ui.back_keyboard("menu:clan"))
+                return
+            await clan_manage_view(update, context, "✅ Join settings updated.")
             return
         if action == "manage" and len(parts) > 2:
             await clan_manage_prompt(update, context, parts[2])
@@ -5210,7 +6390,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if page < total_pages:
             nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"art:list:{entity_type}:{page + 1}"))
         rows = [nav] if nav else []
-        rows.append([InlineKeyboardButton("🖼️ Crown Art", callback_data="crownart:view"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+        rows.append([InlineKeyboardButton("🖼️ Crown Art", callback_data="crownart:view")])
         await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
         return
     if key == "boss":
@@ -5302,6 +6482,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         action = parts[1] if len(parts) > 1 else ""
         db = get_db(context)
+        if action in ("view", "list"):
+            await pets_view(update, context)
+            return
         if action == "equip" and len(parts) > 2:
             result = db.equip_pet(update.effective_user.id, parts[2])
             if not result:
@@ -5326,7 +6509,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             pet = result.get("pet", {})
             await respond(update, f"🥚 Hatched {pet.get('emoji', '🐾')} <b>{ui.esc(pet.get('name', 'Companion'))}</b>!", InlineKeyboardMarkup([
-                [InlineKeyboardButton("🐾 Pets", callback_data="menu:pets"), InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+                [InlineKeyboardButton("🐾 Pets", callback_data="menu:pets")],
             ]))
             return
         await pets_view(update, context)
