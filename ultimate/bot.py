@@ -269,7 +269,12 @@ def series_name(series: str) -> str:
 def display_name(player: dict | None, fallback: str = "Summoner") -> str:
     if not player:
         return fallback
-    return player.get("first_name") or player.get("username") or str(player.get("user_id", fallback))
+    return (
+        player.get("nickname")
+        or player.get("first_name")
+        or player.get("username")
+        or str(player.get("user_id", fallback))
+    )
 
 
 def trade_keyboard(trade: dict) -> InlineKeyboardMarkup:
@@ -403,6 +408,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     player = await guard(update, context)
     if player is None:
         return
+    referral_note = ""
+    if existing is None and context.args and context.args[0].startswith("ref_"):
+        try:
+            referrer_id = int(context.args[0][4:])
+        except ValueError:
+            referrer_id = 0
+        if referrer_id:
+            applied = db.apply_referral(update.effective_user.id, referrer_id)
+            if applied:
+                referral_note = (
+                    "\n\n🤝 <b>Referral bonus!</b> +300 Yens and +2 Gems have been added to your account."
+                )
+                try:
+                    await notify_user(
+                        context,
+                        referrer_id,
+                        "🤝 <b>New recruit!</b>\n\n"
+                        f"<b>{ui.esc(display_name(player))}</b> joined with your invite link.\n"
+                        "🎁 +500 Yens • +3 Gems • +1 Ticket",
+                        ui.back_keyboard("menu:main"),
+                    )
+                except TelegramError:
+                    pass
     if existing is not None:
         await respond(
             update,
@@ -420,6 +448,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Hunt NPCs, bosses, world raids, and clan raids\n"
         f"• Build clans, trade, duel, and rule the arena\n\n"
         f"Pick a series to set your home world, then open the menu."
+        + referral_note
     )
     await respond(update, text, ui.series_keyboard("startseries"))
 
@@ -561,7 +590,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/quests [daily|weekly|monthly] • /claim [type]\n"
         "/achievements • /claimach • /titles • /title &lt;title_id&gt;\n\n"
         "<b>🌍 World & Profile</b>\n"
-        "/profile • /stats • /daily • /weekly • /monthly\n"
+        "/profile • /stats • /daily • /daily_status • /weekly • /monthly\n"
+        "/spin — daily lucky wheel • /work — earn yens every 30m\n"
+        "/referral — invite link and rewards • /nickname &lt;name&gt; — set display name\n"
+        "/tournament — weekly 10-slot arena bracket • /ping — latency and uptime\n"
         "/leaderboard [wealth|players|arena|clans|raid] — wealth/collection is page 1\n/wealth — shortcuts to wealth leaderboard • /collection — per-series collection progress\n"
         "/travel &lt;series&gt; or /switch &lt;series&gt; • /series • /codex • /events\n"
         "/chapters [series] • /chapter [series] [number] — story battles\n"
@@ -2814,7 +2846,7 @@ async def leaderboard_view(update: Update, context: ContextTypes.DEFAULT_TYPE, c
             if not rows:
                 lines.append("No entries yet.")
             for index, row in enumerate(rows, 1):
-                name = ui.esc(row.get("first_name") or row.get("username") or "Summoner")
+                name = ui.esc(row.get("nickname") or row.get("first_name") or row.get("username") or "Summoner")
                 lines.append(f"{index}. {name} — {formatter(row)}")
             lines.append("")
         keyboard = InlineKeyboardMarkup([
@@ -2836,15 +2868,24 @@ async def leaderboard_view(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         for index, row in enumerate(rows, 1):
             lines.append(f"{index}. {ui.esc(row.get('first_name') or row.get('username') or 'Summoner')} — {ui.fmt(row['damage'])}")
     else:
-        order = "arena" if category == "arena" else "level"
+        orders = {"arena": "arena", "wins": "wins", "gacha": "gacha", "raid": "raid", "level": "level", "players": "level", "exp": "level"}
+        order = orders.get(category, "level")
         rows = db.leaderboard_players(10, order)
-        lines.append(f"🏆 <b>TOP PLAYERS — {category.title()}</b>")
+        titles = {"arena": "ARENA", "wins": "WINS", "gacha": "SUMMONS", "raid": "WORLD BOSS DAMAGE", "level": "LEVEL", "players": "PLAYERS", "exp": "LEVEL"}
+        lines.append(f"🏆 <b>TOP PLAYERS — {titles.get(category, category.title())}</b>")
         for index, row in enumerate(rows, 1):
-            if category == "arena":
+            if order == "arena":
                 score = f"{row['arena_rating']} rating"
+            elif order == "gacha":
+                score = f"{ui.fmt(row['gacha_pulls'])} pulls • Lv.{row['level']}"
+            elif order == "raid":
+                score = f"{ui.fmt(row['raid_damage'])} damage"
+            elif order == "wins":
+                score = f"{ui.fmt(row['wins'])} wins • Lv.{row['level']}"
             else:
                 score = f"Lv.{row['level']} • {ui.fmt(row['wins'])} wins"
-            lines.append(f"{index}. {ui.esc(row.get('first_name') or row.get('username') or 'Summoner')} — {score}")
+            name = row.get("nickname") or row.get("first_name") or row.get("username") or "Summoner"
+            lines.append(f"{index}. {ui.esc(name)} — {score}")
     if len(lines) == 1:
         lines.append("No entries yet.")
     keyboard = InlineKeyboardMarkup([
@@ -3577,6 +3618,38 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await respond(update, f"❌ {ui.esc(result['reason'])}")
         return
     await respond(update, f"📅 <b>Daily reward claimed!</b>\n🔥 Streak: {result['streak']}\n🎁 {ui.reward_text(result['rewards'])}", ui.main_menu_keyboard())
+
+
+async def cmd_daily_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    try:
+        from .db import month_key, today_key, week_key
+    except ImportError:
+        from db import month_key, today_key, week_key
+
+    today_done = player.get("daily_day") == today_key()
+    weekly_done = player.get("weekly_week") == week_key()
+    monthly_done = player.get("monthly_month") == month_key()
+    spin_done = not db.spin_ready(update.effective_user.id)
+    remaining = db.work_remaining(update.effective_user.id)
+    minutes, seconds = divmod(remaining, 60)
+    lines = [
+        "📅 <b>DAILY STATUS</b>",
+        "",
+        f"{'✅' if today_done else '🎁'} Daily reward — {'claimed' if today_done else 'ready to claim'}",
+        f"🔥 Daily streak: <b>{int(player.get('daily_streak', 0))}</b>",
+        f"{'✅' if weekly_done else '🎁'} Weekly reward — {'claimed' if weekly_done else 'ready'}",
+        f"{'✅' if monthly_done else '🎁'} Monthly reward — {'claimed' if monthly_done else 'ready'}",
+        "",
+        f"{'✅' if spin_done else '🎡'} Lucky wheel — {'spin tomorrow' if spin_done else 'ready to spin'}",
+        f"{'💤' if remaining else '🧰'} Work shift — {'ready' if not remaining else f'in {minutes}m {seconds:02d}s'}",
+        "",
+        f"⚡ Stamina: <b>{player.get('stamina', 0)}/{player.get('max_stamina', 100)}</b>",
+    ]
+    await respond(update, "\n".join(lines), ui.back_keyboard("menu:main"))
 
 
 async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6159,8 +6232,272 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await respond(update, f"👑 Custom art saved for <b>{ui.esc(name)}</b> ({entity_type}).")
 
 
+async def cmd_spin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    if update.callback_query is None:
+        ready = db.spin_ready(update.effective_user.id)
+        lines = [
+            "🎡 <b>DAILY LUCKY WHEEL</b>",
+            "",
+            "One free spin every day. Every segment wins something.",
+            "",
+            "💠 Yens • 💎 Gems • 🔮 Crystals • 🎟️ Tickets",
+            "",
+            "🌟 Jackpot: <b>1500 Yens + 8 Gems</b>",
+            "👑 Grand prize: <b>40 Gems + 12 Crystals</b>",
+            "",
+            "Tap the button to spin the wheel!",
+        ]
+        rows = []
+        if ready:
+            rows.append([InlineKeyboardButton("🎡 Spin Now", callback_data="spin:go")])
+        else:
+            lines.append("\n✅ You already spun today. Come back tomorrow.")
+        rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+        photo = banner("spin") or banner("shop")
+        if photo:
+            await respond_photo(update, photo, "\n".join(lines), InlineKeyboardMarkup(rows))
+        else:
+            await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+        return
+    result = db.claim_spin(update.effective_user.id)
+    if not result["ok"]:
+        await respond(update, f"⏳ {ui.esc(result['reason'])}", ui.back_keyboard("menu:main"))
+        return
+    lines = [
+        "🎡 <b>LUCKY WHEEL</b>",
+        "",
+        "🎉 The wheel stops on...",
+        f"<b>{result['label']}</b>",
+        "",
+        f"🎁 {ui.reward_text(result['rewards'])}",
+        "",
+        "Come back tomorrow for another free spin.",
+    ]
+    photo = banner("spin")
+    if photo:
+        await respond_photo(update, photo, "\n".join(lines), ui.back_keyboard("menu:main"))
+    else:
+        await respond(update, "\n".join(lines), ui.back_keyboard("menu:main"))
+
+
+async def cmd_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    result = get_db(context).work_shift(update.effective_user.id)
+    if not result["ok"]:
+        minutes, seconds = divmod(max(0, int(result["remaining"])), 60)
+        await respond(
+            update,
+            f"😮‍💨 <b>You need a short rest.</b>\n\nNext shift available in <b>{minutes}m {seconds:02d}s</b>.",
+            ui.back_keyboard("menu:main"),
+        )
+        return
+    await respond(
+        update,
+        f"🧰 <b>SHIFT COMPLETE</b>\n\nYou {ui.esc(result['job'])}.\n\n"
+        f"🎁 {ui.reward_text(result['rewards'])}",
+        ui.back_keyboard("menu:main"),
+    )
+
+
+async def cmd_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    username = context.bot.username or "DragonBall_legendsBot"
+    link = f"https://t.me/{username}?start=ref_{update.effective_user.id}"
+    count = db.referral_count(update.effective_user.id)
+    share = f"https://t.me/share/url?url={link}&text=Join%20Ultimate%20Legends%20and%20claim%20your%20starter%20pack!"
+    lines = [
+        "🤝 <b>INVITE FRIENDS</b>",
+        "",
+        f"Your invite link:\n<code>{ui.esc(link)}</code>",
+        "",
+        f"👥 Successful invites: <b>{count}</b>",
+        "",
+        "<b>Rewards</b>",
+        "• You: <b>500 Yens + 3 Gems + 1 Ticket</b> per friend",
+        "• Your friend: <b>300 Yens + 2 Gems</b>",
+        "",
+        "Share your link and grow the multiverse!",
+    ]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Share Invite", url=share)],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+    ])
+    photo = banner("referral") or banner("heroes")
+    if photo:
+        await respond_photo(update, photo, "\n".join(lines), keyboard)
+    else:
+        await respond(update, "\n".join(lines), keyboard)
+
+
+async def cmd_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    if not context.args:
+        current = display_name(player)
+        await respond(
+            update,
+            f"🏷️ <b>NICKNAME</b>\n\nCurrent: <b>{ui.esc(current)}</b>\n\nUse <code>/nickname NewName</code> (2-20 characters).",
+            ui.back_keyboard("menu:main"),
+        )
+        return
+    name = " ".join(context.args)
+    result = get_db(context).set_nickname(update.effective_user.id, name)
+    if not result["ok"]:
+        await respond(update, f"❌ {ui.esc(result['reason'])}")
+        return
+    await respond(
+        update,
+        f"✅ Nickname updated to <b>{ui.esc(result['nickname'])}</b>.\nIt will appear on your profile and leaderboards.",
+        ui.back_keyboard("menu:main"),
+    )
+
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    started = time.perf_counter()
+    try:
+        await context.bot.get_me()
+        latency = (time.perf_counter() - started) * 1000
+        bot_data = context.application.bot_data
+        uptime = int(time.time() - float(bot_data.get("started_at", time.time())))
+        hours, remainder = divmod(uptime, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        await respond(
+            update,
+            f"🏓 <b>PONG</b>\n\n⚡ Telegram latency: <b>{latency:.0f} ms</b>\n"
+            f"⏱️ Uptime: <b>{hours}h {minutes}m {seconds}s</b>",
+            ui.back_keyboard("menu:main"),
+        )
+    except TelegramError as exc:
+        await respond(update, f"⚠️ Ping failed: {ui.esc(str(exc))}")
+
+
+PLACEMENT_LABELS = {
+    "champion": "👑 Champion",
+    "runner_up": "🥈 Runner-up",
+    "semifinalist": "🥉 Semifinalist",
+    "entrant": "🎖️ Entrant",
+}
+
+
+async def cmd_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    state = db.tournament_state()
+    rows = []
+    lines = ["🏆 <b>WEEKLY ARENA TOURNAMENT</b>", ""]
+    if state["status"] == "open":
+        entries = state["entries"]
+        lines.extend([
+            f"🎟️ Entry: <b>300 Yens</b> • Slots: <b>{len(entries)}/10</b>",
+            "",
+            "<b>Prize pool</b>",
+            "👑 5000 Yens + 60 Gems + 12 Crystals + 2 Tickets",
+            "🥈 2000 Yens + 25 Gems + 5 Crystals",
+            "🥉 800 Yens + 8 Gems + 2 Crystals",
+            "🎖️ 300 Yens + 120 EXP",
+            "",
+            "<b>Registered fighters</b>",
+        ])
+        if entries:
+            for index, entry in enumerate(entries, 1):
+                name = ui.esc(str(entry.get("name") or "Fighter"))
+                lines.append(f"{index}. {name} — Lv.{entry.get('level', 1)} • {ui.fmt(entry.get('power', 0))} power")
+        else:
+            lines.append("No fighters yet. Be the first!")
+        lines.extend(["", "The bracket starts automatically when all 10 slots fill."])
+        if not any(int(entry["user_id"]) == update.effective_user.id for entry in entries):
+            rows.append([InlineKeyboardButton("⚔️ Join Tournament — 300 Yens", callback_data="tour:join")])
+        else:
+            lines.append("\n✅ You are registered. Good luck!")
+        rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="tour:refresh")])
+    else:
+        champion = state.get("champion") or {}
+        placements = state.get("placements", {})
+        my_place = placements.get(str(update.effective_user.id))
+        lines.extend([
+            "✅ <b>This week's tournament is complete.</b>",
+            "",
+            f"👑 Champion: <b>{ui.esc(str(champion.get('name') or 'Unknown'))}</b>",
+        ])
+        if my_place:
+            lines.append(f"🎖️ Your result: <b>{PLACEMENT_LABELS.get(my_place, my_place.title())}</b>")
+        lines.extend(["", "<b>Bracket</b>"])
+        for round_data in state.get("rounds", []):
+            lines.append(f"<b>Round {round_data.get('round', '?')}</b>")
+            for match in round_data.get("matches", [])[:5]:
+                if match.get("b") == "BYE":
+                    lines.append(f"• {ui.esc(str(match['a']))} — bye")
+                else:
+                    lines.append(f"• {ui.esc(str(match['a']))} vs {ui.esc(str(match['b']))} → <b>{ui.esc(str(match['winner']))}</b>")
+            lines.append("")
+        rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="tour:refresh")])
+    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    photo = banner("tournament") or banner("events")
+    text = "\n".join(lines)
+    if photo and state["status"] == "open":
+        await respond_photo(update, photo, text, InlineKeyboardMarkup(rows))
+    else:
+        await respond(update, text, InlineKeyboardMarkup(rows))
+
+
+async def _join_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    result = db.tournament_join(update.effective_user.id)
+    if not result["ok"]:
+        await respond(update, f"❌ {ui.esc(result['reason'])}", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="tour:refresh")]]))
+        return
+    state = result["state"]
+    if result.get("resolved"):
+        champion = state.get("champion") or {}
+        my_place = state.get("placements", {}).get(str(update.effective_user.id), "entrant")
+        lines = [
+            "🏆 <b>TOURNAMENT COMPLETE!</b>",
+            "",
+            "The bracket filled and the battles were fought.",
+            "",
+            f"👑 Champion: <b>{ui.esc(str(champion.get('name') or 'Unknown'))}</b>",
+            f"🎖️ Your result: <b>{PLACEMENT_LABELS.get(my_place, my_place.title())}</b>",
+            "",
+            "Rewards have been delivered. A new tournament opens next week.",
+        ]
+    else:
+        lines = [
+            "✅ <b>You joined the tournament!</b>",
+            "",
+            f"Slots filled: <b>{len(state['entries'])}/10</b>",
+            "The bracket starts automatically when all 10 slots fill.",
+        ]
+    await respond(update, "\n".join(lines), InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 View Tournament", callback_data="tour:refresh")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+    ]))
+
+
+async def cmd_tournament_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _join_tournament(update, context)
+
+
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    category = context.args[0].lower() if context.args else "players"
+    command = ""
+    if update.effective_message is not None and update.effective_message.text:
+        command = update.effective_message.text.split()[0].lstrip("/").split("@")[0].lower()
+    aliases = {"topexp": "players", "topwins": "wins", "topgacha": "gacha", "topraid": "raid", "toparena": "arena"}
+    category = context.args[0].lower() if context.args else aliases.get(command, "players")
     await leaderboard_view(update, context, category)
 
 
@@ -6267,6 +6604,7 @@ async def _startup_welcome_broadcast(application: Application) -> None:
 async def post_init(application: Application) -> None:
     db = Database(config.DB_PATH)
     application.bot_data["db"] = db
+    application.bot_data["started_at"] = time.time()
     logger.info("Database ready at %s", config.DB_PATH)
     logger.info("Loaded %d characters, %d gear, %d skills", len(data.CHARACTERS), len(data.GEAR), len(data.SKILLS))
     public_commands = [BotCommand(name, desc) for name, desc in COMMANDS]
@@ -6315,6 +6653,13 @@ COMMANDS: list[tuple[str, str]] = [
     ("redeem", "Redeem a code"),
     ("help", "Full command guide"),
     ("profile", "Profile, power and currencies"),
+    ("daily_status", "Daily, weekly, spin and work status"),
+    ("spin", "Daily lucky wheel"),
+    ("work", "Work a shift for yens"),
+    ("referral", "Invite friends and earn rewards"),
+    ("nickname", "Change your display name"),
+    ("tournament", "Weekly arena tournament"),
+    ("ping", "Bot latency and uptime"),
     ("status", "Account overview and active actions"),
     ("search", "Search heroes, gear, items, pets, skills"),
     ("compare", "Compare your progress with another player"),
@@ -6523,6 +6868,28 @@ HANDLERS = {
     "trade": cmd_trade,
     "grant": cmd_grant,
     "daily": cmd_daily,
+    "daily_status": cmd_daily_status,
+    "dailystatus": cmd_daily_status,
+    "balance": cmd_wealth,
+    "spin": cmd_spin,
+    "wheel": cmd_spin,
+    "work": cmd_work,
+    "job": cmd_work,
+    "referral": cmd_referral,
+    "invite": cmd_referral,
+    "ref": cmd_referral,
+    "nickname": cmd_nickname,
+    "rename": cmd_nickname,
+    "ping": cmd_ping,
+    "tournament": cmd_tournament,
+    "tourney": cmd_tournament,
+    "tournament_status": cmd_tournament,
+    "tournament_join": cmd_tournament_join,
+    "topexp": cmd_top,
+    "topwins": cmd_top,
+    "topgacha": cmd_top,
+    "topraid": cmd_top,
+    "toparena": cmd_top,
     "weekly": cmd_weekly,
     "monthly": cmd_monthly,
     "travel": cmd_travel,
@@ -6627,6 +6994,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if key == "skillshop":
         context.args = [parts[1], parts[2]] if len(parts) > 2 and parts[2].isdigit() else [parts[1]]
         await cmd_skillshop(update, context)
+        return
+    if key == "spin":
+        await cmd_spin(update, context)
+        return
+    if key == "tour":
+        action = parts[1] if len(parts) > 1 else "view"
+        if action == "join":
+            await _join_tournament(update, context)
+        else:
+            await cmd_tournament(update, context)
         return
     if key == "duel":
         await handle_duel_callback(update, context, parts)

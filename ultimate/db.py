@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS players (
     user_id INTEGER PRIMARY KEY,
     username TEXT,
     first_name TEXT,
+    nickname TEXT NOT NULL DEFAULT '',
     series TEXT NOT NULL DEFAULT 'dragonball',
     rank TEXT NOT NULL DEFAULT 'Rookie',
     level INTEGER NOT NULL DEFAULT 1,
@@ -434,7 +435,7 @@ CREATE INDEX IF NOT EXISTS idx_queries_user ON queries(user_id);
 """
 
 PLAYER_COLUMNS = {
-    "username", "first_name", "series", "rank", "level", "exp", "yens", "gems",
+    "username", "first_name", "nickname", "series", "rank", "level", "exp", "yens", "gems",
     "crystals", "tickets", "stamina", "max_stamina", "stamina_updated", "hp",
     "current_hp", "atk", "def", "spd", "skill_points", "equipped_char", "team",
     "weapon", "armor", "accessory", "helmet", "shoes", "pants", "clothes", "robe",
@@ -451,6 +452,7 @@ COUNTER_METRICS = {
     "raid_damage", "total_battles", "losses", "npc_streak", "market_sales",
     "characters", "level", "arena_rating", "series_dragonball", "series_naruto",
     "series_bleach", "series_jujutsu", "series_tempest", "dungeon", "fish", "mine",
+    "referrals",
 }
 
 
@@ -512,6 +514,7 @@ class Database:
     def _migrate(self, c: sqlite3.Connection) -> None:
         migrations = {
             "players": {
+                "nickname": "TEXT NOT NULL DEFAULT ''",
                 "hp": "INTEGER NOT NULL DEFAULT 1000",
                 "current_hp": "INTEGER NOT NULL DEFAULT 1000",
                 "mp": "INTEGER NOT NULL DEFAULT 200",
@@ -1382,6 +1385,230 @@ class Database:
                     "UPDATE clans SET exp=exp+?, level=1 + ((exp+?) / 10000) WHERE id=(SELECT clan_id FROM players WHERE user_id=?)",
                     (value, value, int(user_id)),
                 )
+
+    def set_nickname(self, user_id: int, nickname: str) -> dict:
+        name = " ".join((nickname or "").split())
+        if len(name) < 2:
+            return {"ok": False, "reason": "Nickname must be at least 2 characters."}
+        if len(name) > 20:
+            return {"ok": False, "reason": "Nickname must be 20 characters or fewer."}
+        if any(character in name for character in "<>&"):
+            return {"ok": False, "reason": "Nickname cannot contain <, > or &."}
+        self.require_player(user_id)
+        with self.conn() as c:
+            c.execute("UPDATE players SET nickname=? WHERE user_id=?", (name, int(user_id)))
+        return {"ok": True, "nickname": name}
+
+    SPIN_SEGMENTS = [
+        ("💠 80 Yens", {"yens": 80}, 20),
+        ("💠 220 Yens", {"yens": 220}, 18),
+        ("💎 5 Gems", {"gems": 5}, 16),
+        ("🔮 4 Crystals", {"crystals": 4}, 12),
+        ("🎟️ 1 Ticket", {"tickets": 1}, 8),
+        ("💠 700 Yens", {"yens": 700}, 10),
+        ("💎 15 Gems", {"gems": 15}, 8),
+        ("🌟 1500 Yens + 8 Gems", {"yens": 1500, "gems": 8}, 5),
+        ("👑 40 Gems + 12 Crystals", {"gems": 40, "crystals": 12}, 3),
+    ]
+
+    def spin_ready(self, user_id: int) -> bool:
+        return self.setting_get(f"spin:{today_key()}:{int(user_id)}") != "1"
+
+    def claim_spin(self, user_id: int) -> dict:
+        self.require_player(user_id)
+        today = today_key()
+        key = f"spin:{today}:{int(user_id)}"
+        if self.setting_get(key) == "1":
+            return {"ok": False, "reason": "You already spun the wheel today. Come back tomorrow."}
+        labels = [segment[0] for segment in self.SPIN_SEGMENTS]
+        weights = [segment[2] for segment in self.SPIN_SEGMENTS]
+        index = random.choices(range(len(labels)), weights=weights, k=1)[0]
+        label, rewards, _ = self.SPIN_SEGMENTS[index]
+        self.setting_set(key, "1")
+        self.grant_rewards(user_id, rewards)
+        return {"ok": True, "label": label, "rewards": rewards, "index": index}
+
+    WORK_JOBS = [
+        "patrolled the city walls",
+        "trained recruits at the dojo",
+        "cleared monsters from the trade road",
+        "delivered supplies to the frontier",
+        "guarded a merchant caravan",
+        "helped rebuild the arena stands",
+        "hunted bounties in the badlands",
+        "worked the docks at the sky harbor",
+    ]
+
+    def work_remaining(self, user_id: int, cooldown: int = 1800) -> int:
+        try:
+            last = float(self.setting_get(f"work:{int(user_id)}") or 0)
+        except ValueError:
+            last = 0.0
+        return max(0, int(cooldown - (time.time() - last)))
+
+    def work_shift(self, user_id: int, cooldown: int = 1800) -> dict:
+        player = self.require_player(user_id)
+        key = f"work:{int(user_id)}"
+        now = time.time()
+        try:
+            last = float(self.setting_get(key) or 0)
+        except ValueError:
+            last = 0.0
+        remaining = int(cooldown - (now - last))
+        if remaining > 0:
+            return {"ok": False, "remaining": remaining}
+        level = int(player.get("level", 1))
+        luck = int(player.get("luck", 10))
+        rewards = {
+            "yens": random.randint(110, 170) + level * 6 + luck * 3,
+            "exp": 20 + level * 3,
+        }
+        if random.random() < 0.12:
+            rewards["gems"] = 1
+        if random.random() < 0.05:
+            rewards["tickets"] = 1
+        self.setting_set(key, str(now))
+        self.grant_rewards(user_id, rewards)
+        return {"ok": True, "rewards": rewards, "job": random.choice(self.WORK_JOBS), "cooldown": cooldown}
+
+    def apply_referral(self, new_user_id: int, referrer_id: int) -> dict | None:
+        new_user_id = int(new_user_id)
+        referrer_id = int(referrer_id)
+        if new_user_id == referrer_id:
+            return None
+        if self.player(referrer_id) is None:
+            return None
+        key = f"referral:{new_user_id}"
+        if self.setting_get(key):
+            return None
+        self.setting_set(key, str(referrer_id))
+        self.bump(referrer_id, "referrals")
+        new_rewards = {"yens": 300, "gems": 2, "exp": 50}
+        referrer_rewards = {"yens": 500, "gems": 3, "tickets": 1, "exp": 80}
+        self.grant_rewards(new_user_id, new_rewards)
+        self.grant_rewards(referrer_id, referrer_rewards)
+        return {"referrer_rewards": referrer_rewards, "new_rewards": new_rewards}
+
+    def referral_count(self, user_id: int) -> int:
+        return self.counter(user_id, "referrals")
+
+    def tournament_state(self) -> dict:
+        raw = self.setting_get(f"tournament:{week_key()}", "")
+        if not raw:
+            return {
+                "week": week_key(), "status": "open", "entries": [],
+                "rounds": [], "champion": None, "placements": {},
+            }
+        try:
+            state = json.loads(raw)
+        except (TypeError, ValueError):
+            state = {}
+        state.setdefault("week", week_key())
+        state.setdefault("status", "open")
+        state.setdefault("entries", [])
+        state.setdefault("rounds", [])
+        state.setdefault("champion", None)
+        state.setdefault("placements", {})
+        return state
+
+    def _save_tournament(self, state: dict) -> None:
+        self.setting_set(f"tournament:{week_key()}", json.dumps(state))
+
+    def tournament_join(self, user_id: int, cost: int = 300) -> dict:
+        user_id = int(user_id)
+        player = self.require_player(user_id)
+        state = self.tournament_state()
+        if state["status"] != "open":
+            return {"ok": False, "reason": "This week's tournament already started. Check back next week.", "state": state}
+        if any(int(entry["user_id"]) == user_id for entry in state["entries"]):
+            return {"ok": False, "reason": "You already joined this week's tournament.", "state": state}
+        if len(state["entries"]) >= 10:
+            return {"ok": False, "reason": "This week's tournament is full.", "state": state}
+        if not self.spend(user_id, yens=cost):
+            return {"ok": False, "reason": f"You need {cost} yens to enter.", "state": state}
+        state["entries"].append({
+            "user_id": user_id,
+            "name": player.get("nickname") or player.get("first_name") or player.get("username") or f"Player {user_id}",
+            "power": int(self._player_power(user_id)),
+            "level": int(player.get("level", 1)),
+        })
+        resolved = False
+        if len(state["entries"]) >= 10:
+            self._resolve_tournament(state)
+            resolved = True
+        self._save_tournament(state)
+        return {"ok": True, "state": state, "resolved": resolved, "cost": cost}
+
+    def tournament_resolve(self) -> dict:
+        state = self.tournament_state()
+        if state["status"] != "open" or not state["entries"]:
+            return {"ok": False, "reason": "Nothing to resolve.", "state": state}
+        self._resolve_tournament(state)
+        self._save_tournament(state)
+        return {"ok": True, "state": state}
+
+    def _player_power(self, user_id: int) -> int:
+        try:
+            import game as _game
+        except ImportError:
+            from . import game as _game
+        return int(_game.power_score(_game.effective_stats(self, user_id)))
+
+    def _resolve_tournament(self, state: dict) -> None:
+        participants = [dict(entry) for entry in state["entries"]]
+        random.shuffle(participants)
+        rounds = []
+        eliminated: dict[int, int] = {}
+        round_number = 1
+        while len(participants) > 1:
+            pairs = []
+            next_round = []
+            for index in range(0, len(participants), 2):
+                first = participants[index]
+                if index + 1 >= len(participants):
+                    pairs.append({"a": first["name"], "b": "BYE", "winner": first["name"], "a_id": first["user_id"], "b_id": 0})
+                    next_round.append(first)
+                    continue
+                second = participants[index + 1]
+                score_a = first["power"] * random.uniform(0.78, 1.22) + first["level"] * 4
+                score_b = second["power"] * random.uniform(0.78, 1.22) + second["level"] * 4
+                winner, loser = (first, second) if score_a >= score_b else (second, first)
+                pairs.append({
+                    "a": first["name"], "b": second["name"],
+                    "a_id": first["user_id"], "b_id": second["user_id"],
+                    "winner": winner["name"], "winner_id": winner["user_id"],
+                })
+                next_round.append(winner)
+                eliminated[int(loser["user_id"])] = round_number
+            rounds.append({"round": round_number, "matches": pairs})
+            participants = next_round
+            round_number += 1
+        champion = participants[0]
+        total_rounds = len(rounds)
+        state["rounds"] = rounds
+        state["champion"] = {"user_id": champion["user_id"], "name": champion["name"]}
+        state["status"] = "done"
+        for entry in state["entries"]:
+            uid = int(entry["user_id"])
+            if uid == int(champion["user_id"]):
+                place = "champion"
+            elif eliminated.get(uid) == total_rounds:
+                place = "runner_up"
+            elif eliminated.get(uid) == total_rounds - 1:
+                place = "semifinalist"
+            else:
+                place = "entrant"
+            state["placements"][str(uid)] = place
+            rewards = {"exp": 120}
+            if place == "champion":
+                rewards.update({"yens": 5000, "gems": 60, "crystals": 12, "tickets": 2})
+            elif place == "runner_up":
+                rewards.update({"yens": 2000, "gems": 25, "crystals": 5})
+            elif place == "semifinalist":
+                rewards.update({"yens": 800, "gems": 8, "crystals": 2})
+            else:
+                rewards.update({"yens": 300})
+            self.grant_rewards(uid, rewards)
 
     def claim_daily(self, user_id: int) -> dict:
         player = self.require_player(user_id)
