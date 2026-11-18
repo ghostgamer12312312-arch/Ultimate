@@ -12,7 +12,14 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import (
@@ -93,6 +100,41 @@ async def respond(update: Update, text: str, keyboard=None) -> None:
             await message.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except (BadRequest, TelegramError) as exc:
         logger.warning("Could not send response: %s", exc)
+
+
+BANNER_DIR = Path(__file__).resolve().parent / "assets" / "banners"
+
+
+def banner(name: str) -> str | None:
+    path = BANNER_DIR / f"{name}.jpg"
+    return str(path) if path.exists() else None
+
+
+async def respond_photo(update: Update, photo: str, caption: str, keyboard=None) -> None:
+    caption = caption or ""
+    try:
+        if update.callback_query is not None:
+            try:
+                await update.callback_query.edit_message_media(
+                    InputMediaPhoto(media=photo, caption=caption[:1024], parse_mode=ParseMode.HTML),
+                    reply_markup=keyboard,
+                )
+                return
+            except BadRequest as exc:
+                if "not modified" in str(exc).lower():
+                    return
+        message = update.effective_message
+        if message is None:
+            return
+        await message.reply_photo(
+            photo=photo,
+            caption=caption[:1024],
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+        )
+    except (BadRequest, TelegramError) as exc:
+        logger.warning("Could not send photo response: %s", exc)
+        await respond(update, caption, keyboard)
 
 
 async def show_battle(update: Update, context: ContextTypes.DEFAULT_TYPE, battle_data: dict) -> None:
@@ -291,8 +333,70 @@ def start_welcome_text(db: Database, player: dict) -> str:
     )
 
 
+GROUP_CHAT_TYPES = ("group", "supergroup")
+
+GROUP_ALLOWED_COMMANDS = {
+    "start", "help", "about", "myid", "userid", "user_id", "uid", "getid", "whois", "id",
+    "profile", "stats", "status", "overview", "compare", "query", "report", "bugreport",
+    "leaderboard", "top", "wealth", "collection", "arena", "duel",
+    "clan", "clan_create", "clan_join", "clan_leave", "clan_info", "clan_donate",
+    "clan_kick", "clan_promote", "clan_demote", "clan_announce", "clan_disband",
+    "clan_invite", "clan_add", "clan_accept", "clan_transfer",
+    "clanraid", "clanraid_start", "clanraid_attack",
+}
+
+
+def chat_type_name(update: Update) -> str:
+    chat = update.effective_chat
+    if chat is None:
+        return ""
+    value = getattr(chat.type, "value", chat.type)
+    return str(value)
+
+
+def is_group_chat(update: Update) -> bool:
+    return chat_type_name(update) in GROUP_CHAT_TYPES
+
+
+def dm_only_notice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    username = context.bot.username or "DragonBall_legendsBot"
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("💬 Open in Private Chat", url=f"https://t.me/{username}?start=group"),
+    ]])
+
+
+def group_command_guard(name: str, handler):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if is_group_chat(update):
+            user = update.effective_user
+            admin = get_db(context).is_admin(user.id if user else None)
+            if not admin and name not in GROUP_ALLOWED_COMMANDS:
+                await respond(
+                    update,
+                    "⚠️ <b>PRIVATE COMMAND</b>\n\n"
+                    "This command only works in a private chat with the bot.\n\n"
+                    "Group features that work here: /duel, /arena, /clan, /clanraid, "
+                    "/leaderboard, /profile and /help.\n\n"
+                    "Tap below to open the bot in DM.",
+                    dm_only_notice(update, context),
+                )
+                return
+        return await handler(update, context)
+
+    return wrapper
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user is None:
+        return
+    if is_group_chat(update):
+        await respond(
+            update,
+            f"🐉 <b>{ui.esc(config.GAME_NAME)}</b>\n\n"
+            "Welcome! Single-player battles, summons and menus work in private chat with the bot.\n\n"
+            "✅ Group-friendly: /duel, /arena, /clan, /clanraid, /leaderboard, /profile, /help",
+            dm_only_notice(update, context),
+        )
         return
     db = get_db(context)
     existing = db.player(update.effective_user.id)
@@ -300,7 +404,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if player is None:
         return
     if existing is not None:
-        await respond(update, start_welcome_text(db, player), ui.main_menu_keyboard())
+        await respond(
+            update,
+            start_welcome_text(db, player)
+            + "\n\nUse /menu to open the main menu, or /help to see every command.",
+        )
         return
     text = (
         f"🐉 <b>WELCOME TO {ui.esc(config.GAME_NAME)}</b> 🐉\n\n"
@@ -761,7 +869,19 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     keyboard = InlineKeyboardMarkup(rows)
     player = db.require_player(update.effective_user.id)
     stats = game.effective_stats(db, update.effective_user.id)
-    await respond(update, profile_text(db, update.effective_user.id), keyboard)
+    text = profile_text(db, update.effective_user.id)
+    photo: str | None = None
+    try:
+        photos = await context.bot.get_user_profile_photos(update.effective_user.id, limit=1)
+        if photos.total_count and photos.photos:
+            photo = photos.photos[0][-1].file_id
+    except TelegramError as exc:
+        logger.info("Profile photo unavailable: %s", exc)
+    photo = photo or banner("heroes")
+    if photo:
+        await respond_photo(update, photo, text, keyboard)
+    else:
+        await respond(update, text, keyboard)
 
 
 async def characters_view(update: Update, context: ContextTypes.DEFAULT_TYPE, args: list[str]) -> None:
@@ -1338,7 +1458,11 @@ async def inventory_view(update: Update, context: ContextTypes.DEFAULT_TYPE, cat
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("🛒 Shop", callback_data="menu:shop"), InlineKeyboardButton("⚙️ Gear Filters", callback_data="menu:gear")])
-    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+    photo = banner("inventory")
+    if photo:
+        await respond_photo(update, photo, "\n".join(lines), InlineKeyboardMarkup(rows))
+    else:
+        await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def cmd_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1477,7 +1601,11 @@ async def gacha_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         featured = ", ".join(ui.esc(data.CHARACTERS[cid]["name"]) for cid in banner["featured"][:3] if cid in data.CHARACTERS)
         lines.append(f"{banner['emoji']} <b>{ui.esc(banner['name'])}</b>\n   Featured: {featured or 'Mixed pool'}")
     lines.append("\nTap a banner to summon heroes. Equipment gacha is /pull.")
-    await respond(update, "\n".join(lines), ui.gacha_keyboard())
+    photo = banner("summon")
+    if photo:
+        await respond_photo(update, photo, "\n".join(lines), ui.gacha_keyboard())
+    else:
+        await respond(update, "\n".join(lines), ui.gacha_keyboard())
 
 
 async def cmd_gacha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1673,13 +1801,17 @@ async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category
         for index in range(0, len(daily_buttons), 2):
             rows.append(daily_buttons[index:index + 2])
         rows.extend(ui.shop_keyboard().inline_keyboard)
-        await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+        photo = banner("shop")
+        if photo:
+            await respond_photo(update, photo, "\n".join(lines), InlineKeyboardMarkup(rows))
+        else:
+            await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
         return
     labels = {"all": "All Items", "potions": "Potions", "summon": "Summoning", "materials": "Materials", "gear": "Gear"}
     if category not in labels:
         category = "all"
     entries = game.shop_catalog(category)
-    per_page = 10
+    per_page = 4
     total_pages = max(1, (len(entries) + per_page - 1) // per_page)
     page = max(1, min(int(page or 1), total_pages))
     start_index = (page - 1) * per_page
@@ -1688,12 +1820,18 @@ async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category
     if not page_entries:
         lines.append("No items in this category.")
     for entry in page_entries:
-        lines.append(f"{entry['emoji']} <b>{ui.esc(entry['name'])}</b> — {ui.fmt(entry['price'])} {entry['currency']} • <code>{entry['id']}</code>")
-    lines.append("\nTap an item to choose quantity, or use /buy &lt;id&gt; [qty].")
+        desc = ui.trim(entry.get("desc", ""), 74)
+        lines.append(f"{entry['emoji']} <b>{ui.esc(entry['name'])}</b> — {ui.fmt(entry['price'])} {entry['currency']}")
+        if desc:
+            lines.append(f"   <i>{ui.esc(desc)}</i>")
+        lines.append(f"   <code>{entry['id']}</code>")
+    lines.append("\nTap an item to buy, or use /buy &lt;id&gt; [qty].")
     rows = []
-    shop_buttons = [InlineKeyboardButton(f"{entry['emoji']} {ui.trim(entry['name'], 18)} • {ui.fmt(entry['price'])}", callback_data=f"shop:item:{entry['id']}:{category}:{page}") for entry in page_entries]
-    for index in range(0, len(shop_buttons), 2):
-        rows.append(shop_buttons[index:index + 2])
+    for entry in page_entries:
+        rows.append([InlineKeyboardButton(
+            f"🛒 {ui.trim(entry['name'], 22)} • {ui.fmt(entry['price'])} {entry['currency']}",
+            callback_data=f"shop:item:{entry['id']}:{category}:{page}",
+        )])
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"shop:page:{category}:{page - 1}"))
@@ -1702,7 +1840,11 @@ async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category
     if nav:
         rows.append(nav)
     rows.extend(ui.shop_keyboard().inline_keyboard)
-    await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+    photo = banner("shop")
+    if photo:
+        await respond_photo(update, photo, "\n".join(lines), InlineKeyboardMarkup(rows))
+    else:
+        await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def show_shop_item(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: str, category: str = "all", page: int = 1) -> None:
@@ -5414,7 +5556,7 @@ async def cmd_skillshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     series = parse_series(context.args[0]) if context.args else player.get("travel", "dragonball")
     page = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else 1
     all_rows = game.skill_shop(series)
-    per_page = 8
+    per_page = 5
     total_pages = max(1, (len(all_rows) + per_page - 1) // per_page)
     page = max(1, min(page, total_pages))
     rows = all_rows[(page - 1) * per_page:page * per_page]
@@ -5437,7 +5579,11 @@ async def cmd_skillshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if nav:
         keyboard_rows.append(nav)
     keyboard_rows.append([InlineKeyboardButton("🧠 My Skills", callback_data="menu:skills")])
-    await respond(update, "\n".join(lines), InlineKeyboardMarkup(keyboard_rows))
+    photo = banner("skills")
+    if photo:
+        await respond_photo(update, photo, "\n".join(lines), InlineKeyboardMarkup(keyboard_rows))
+    else:
+        await respond(update, "\n".join(lines), InlineKeyboardMarkup(keyboard_rows))
 
 
 async def cmd_skillbuy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5573,6 +5719,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str = "", photo: str | None = None):
     if not config.CHANNEL_ID:
         return False, "CHANNEL_ID is not configured in .env."
+    text = f"{text}\n\n— Rise of Legends" if text else text
     try:
         if photo:
             await context.bot.send_photo(
@@ -6459,7 +6606,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     payload = query.data or ""
     parts = payload.split(":")
     key = parts[0]
-    if key in ("admin", "art", "crownart") and not get_db(context).is_admin(update.effective_user.id if update.effective_user else None):
+    is_admin_callback = get_db(context).is_admin(update.effective_user.id if update.effective_user else None)
+    if is_group_chat(update) and not is_admin_callback:
+        allowed = key in {"duel", "arena", "clan", "clanraid", "leaderboard", "btl", "help"}
+        if key == "menu" and len(parts) > 1 and parts[1] in {"clan", "clanraid", "leaderboard", "help"}:
+            allowed = True
+        if not allowed:
+            await respond(
+                update,
+                "⚠️ <b>PRIVATE FEATURE</b>\n\nThis button only works in a private chat with the bot.\n\n"
+                "Try /duel, /arena, /clan, /clanraid or /leaderboard here.",
+                dm_only_notice(update, context),
+            )
+            return
+    if key in ("admin", "art", "crownart") and not is_admin_callback:
         return
     if key == "admin":
         await handle_admin_callback(update, context, parts)
@@ -7223,7 +7383,8 @@ def build_application() -> Application:
         .build()
     )
     for name, handler in HANDLERS.items():
-        application.add_handler(CommandHandler(name, timed_handler(name, handler)))
+        wrapped = timed_handler(name, handler)
+        application.add_handler(CommandHandler(name, group_command_guard(name, wrapped)))
     application.add_handler(CallbackQueryHandler(timed_handler("callback", callback_router)))
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
