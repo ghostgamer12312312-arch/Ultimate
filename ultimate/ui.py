@@ -18,6 +18,13 @@ def fmt(value: int | float) -> str:
     return f"{int(value):,}"
 
 
+def trim(value, limit: int = 24) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:max(1, limit - 1)].rstrip() + "…"
+
+
 def bar(current: int | float, maximum: int | float, length: int = 10) -> str:
     maximum = max(1, int(maximum))
     current = max(0, min(int(current), maximum))
@@ -29,6 +36,25 @@ def percent_bar(current: int | float, maximum: int | float, length: int = 10) ->
     maximum = max(1, int(maximum))
     pct = max(0, min(100, int(current / maximum * 100)))
     return f"{bar(current, maximum, length)} {pct}%"
+
+
+def hearts(current: int | float, maximum: int | float, length: int = 10) -> str:
+    """Compact heart meter that stays readable on a 6.1-inch phone."""
+    maximum = max(1, int(maximum))
+    current = max(0, min(int(current), maximum))
+    filled = int(round(length * current / maximum))
+    return "❤️" * filled + "🖤" * (length - filled)
+
+
+def mana_bar(current: int | float, maximum: int | float, length: int = 10) -> str:
+    maximum = max(1, int(maximum))
+    current = max(0, min(int(current), maximum))
+    filled = int(round(length * current / maximum))
+    return "🔷" * filled + "▫️" * (length - filled)
+
+
+def section(title: str, emoji: str = "▸") -> str:
+    return f"{emoji} <b>{title}</b>"
 
 
 def reward_text(rewards: dict | None, drops: dict | None = None) -> str:
@@ -61,16 +87,24 @@ def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Profile", callback_data="menu:profile"), InlineKeyboardButton("🎴 Summon", callback_data="menu:gacha")],
         [InlineKeyboardButton("⚔️ Hunt", callback_data="menu:hunt"), InlineKeyboardButton("👹 Boss", callback_data="menu:boss")],
-        [InlineKeyboardButton("🌍 World Raid", callback_data="menu:raid"), InlineKeyboardButton("🏯 Clan", callback_data="menu:clan")],
+        [InlineKeyboardButton("🌍 Raid", callback_data="menu:raid"), InlineKeyboardButton("🏰 Dungeon", callback_data="menu:dungeon")],
         [InlineKeyboardButton("🎒 Inventory", callback_data="menu:inventory"), InlineKeyboardButton("🛒 Shop", callback_data="menu:shop")],
-        [InlineKeyboardButton("🏰 Dungeon", callback_data="menu:dungeon"), InlineKeyboardButton("🐾 Pets", callback_data="menu:pets")],
-        [InlineKeyboardButton("🧭 Explore", callback_data="menu:explore"), InlineKeyboardButton("💚 Heal", callback_data="menu:heal")],
+        [InlineKeyboardButton("🏯 Clan", callback_data="menu:clan"), InlineKeyboardButton("🐾 Pets", callback_data="menu:pets")],
+        [InlineKeyboardButton("🧭 Explore", callback_data="menu:explore"), InlineKeyboardButton("📜 Quests", callback_data="menu:quests")],
+        [InlineKeyboardButton("🏆 Rankings", callback_data="menu:leaderboard"), InlineKeyboardButton("📖 Story", callback_data="menu:chapters")],
+        [InlineKeyboardButton("💚 Heal", callback_data="menu:heal"), InlineKeyboardButton("➕ More", callback_data="menu:more")],
+        [InlineKeyboardButton("📖 Help", callback_data="menu:help"), InlineKeyboardButton("🌐 Links", callback_data="menu:links")],
+    ])
+
+
+def more_keyboard() -> "InlineKeyboardMarkup":
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎣 Fish", callback_data="menu:fish"), InlineKeyboardButton("⛏️ Mine", callback_data="menu:mine")],
-        [InlineKeyboardButton("📖 Story", callback_data="menu:chapters"), InlineKeyboardButton("🌌 Summon Boss", callback_data="menu:summonboss")],
-        [InlineKeyboardButton("📜 Quests", callback_data="menu:quests"), InlineKeyboardButton("🏆 Rankings", callback_data="menu:leaderboard")],
-        [InlineKeyboardButton("🎯 Pity", callback_data="menu:pity"), InlineKeyboardButton("🌀 Elements", callback_data="menu:element")],
-        [InlineKeyboardButton("🧹 Unstuck", callback_data="menu:unstuck")],
-        [InlineKeyboardButton("📖 Help", callback_data="menu:help")],
+        [InlineKeyboardButton("🌌 Summon Boss", callback_data="menu:summonboss"), InlineKeyboardButton("🎯 Pity", callback_data="menu:pity")],
+        [InlineKeyboardButton("🌀 Elements", callback_data="menu:element"), InlineKeyboardButton("🧹 Unstuck", callback_data="menu:unstuck")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ])
 
 
@@ -122,6 +156,7 @@ def shop_keyboard():
         [InlineKeyboardButton("🗂️ All Items", callback_data="shop:all"), InlineKeyboardButton("🧪 Potions", callback_data="shop:potions")],
         [InlineKeyboardButton("🎟️ Summon", callback_data="shop:summon"), InlineKeyboardButton("🧰 Materials", callback_data="shop:materials")],
         [InlineKeyboardButton("⚙️ Gear", callback_data="shop:gear"), InlineKeyboardButton("🌅 Daily Shop", callback_data="shop:daily")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ])
 
 

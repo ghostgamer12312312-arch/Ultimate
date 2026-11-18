@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import config
 import data
 
 
@@ -22,10 +23,10 @@ def test_gacha_duplicate_shards_and_pity(database, player):
     result = database.add_character(1001, character)
     assert result[0] is False
     assert database.shards(1001, character) == shards_before + 1
-    database.set_field(1001, "pity", 79)
+    database.set_field(1001, "pity", config.GACHA_PITY - 1)
     pull = database.conn()
     with pull as c:
-        c.execute("UPDATE players SET pity=79 WHERE user_id=1001")
+        c.execute("UPDATE players SET pity=? WHERE user_id=1001", (config.GACHA_PITY - 1,))
     from game import gacha
     result = gacha(database, 1001, "multiverse", 1)
     assert result["ok"]

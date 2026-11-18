@@ -403,7 +403,24 @@ CREATE TABLE IF NOT EXISTS redeem_claims (
     PRIMARY KEY(code, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS admin_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER NOT NULL,
+    admin_name TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    target_id INTEGER,
+    target_name TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_active_battles_user ON active_battles(user_id);
+CREATE INDEX IF NOT EXISTS idx_admin_logs_created ON admin_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_custom_art_type ON custom_art(entity_type);
 CREATE INDEX IF NOT EXISTS idx_characters_user ON characters(user_id);
 CREATE INDEX IF NOT EXISTS idx_counters_user ON counters(user_id, key);
@@ -2213,6 +2230,71 @@ class Database:
 
     def ban(self, user_id: int, banned: bool = True) -> None:
         self.set_field(user_id, "banned", 1 if banned else 0)
+
+    def banned_players(self, limit: int = 25) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT user_id, username, first_name, level, last_seen FROM players "
+                "WHERE banned=1 ORDER BY last_seen DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return _rows_to_dicts(rows)
+
+    def banned_count(self) -> int:
+        with self.conn() as c:
+            return int(c.execute("SELECT COUNT(*) AS n FROM players WHERE banned=1").fetchone()["n"])
+
+    def admin_log(self, admin_id: int, action: str, target_id: int | None = None,
+                  target_name: str = "", detail: str = "", admin_name: str = "") -> None:
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO admin_logs(admin_id, admin_name, action, target_id, target_name, detail, created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (int(admin_id), str(admin_name)[:80], str(action)[:80], target_id,
+                 str(target_name)[:80], str(detail)[:300], _now()),
+            )
+
+    def admin_logs(self, limit: int = 10) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute("SELECT * FROM admin_logs ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+        return _rows_to_dicts(rows)
+
+    def setting_get(self, key: str, default: str = "") -> str:
+        with self.conn() as c:
+            row = c.execute("SELECT value FROM bot_settings WHERE key=?", (str(key),)).fetchone()
+        return str(row["value"]) if row is not None else default
+
+    def setting_set(self, key: str, value) -> None:
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO bot_settings(key, value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(key), str(value)),
+            )
+
+    def expire_code(self, code: str) -> bool:
+        code = (code or "").strip().upper()
+        with self.conn() as c:
+            cursor = c.execute("UPDATE redeem_codes SET max_uses=used_count WHERE code=?", (code,))
+            return cursor.rowcount > 0
+
+    def active_battle_users(self, limit: int = 25) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT user_id, mode, title, updated_at FROM active_battles ORDER BY updated_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return _rows_to_dicts(rows)
+
+    def active_battle_count(self) -> int:
+        with self.conn() as c:
+            return int(c.execute("SELECT COUNT(*) AS n FROM active_battles").fetchone()["n"])
+
+    def db_size_bytes(self) -> int:
+        try:
+            return Path(self.path).stat().st_size
+        except OSError:
+            return 0
     def _transfer_tx(self, c: sqlite3.Connection, source_id: int, target_id: int, kind: str, asset_id, qty: int = 1) -> dict:
         source_id, target_id = int(source_id), int(target_id)
         if source_id == target_id:

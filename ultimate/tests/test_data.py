@@ -25,7 +25,7 @@ def test_character_integrity():
 
 def test_gear_skills_items_integrity():
     for gear in data.GEAR.values():
-        assert gear["slot"] in ("weapon", "armor", "accessory")
+        assert gear["slot"] in data.GEAR_SLOTS
         assert gear["rarity"] in data.RARITIES
         assert gear["element"] in data.ELEMENTS
     for skill in data.SKILLS.values():

@@ -673,10 +673,15 @@ def _pick_character(series: str, rarity: str, banner: dict, rng: random.Random) 
     else:
         pool = [cid for cid in data.CHARACTERS_BY_SERIES.get(series, []) if data.CHARACTERS[cid]["rarity"] == rarity]
     if not pool:
+        pool = list(data.CHARACTERS_BY_RARITY.get(rarity, []))
+    if not pool:
         pool = [cid for cid in data.CHARACTERS if series == "all" or data.CHARACTERS[cid]["series"] == series]
     if not pool:
         pool = list(data.CHARACTERS)
-    featured = [cid for cid in banner.get("featured", []) if cid in pool]
+    featured = [
+        cid for cid in banner.get("featured", [])
+        if cid in pool and data.CHARACTERS[cid]["rarity"] == rarity
+    ]
     if featured and rng.random() < float(banner.get("boost", 0.25)):
         return rng.choice(featured)
     return rng.choice(pool)

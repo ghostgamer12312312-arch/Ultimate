@@ -24,7 +24,7 @@ def _parse_admin_ids(raw: str | None) -> tuple[int, ...]:
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS: tuple[int, ...] = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
-OWNER_IDS: tuple[int, ...] = ADMIN_IDS
+OWNER_IDS: tuple[int, ...] = _parse_admin_ids(os.getenv("OWNER_IDS", "")) or ADMIN_IDS
 DB_PATH: str = (
     os.getenv("ULTIMATE_DB_PATH", "").strip()
     or str(BASE_DIR / "ultimate.db")
@@ -46,6 +46,9 @@ def _parse_chat_id(raw: str | None):
 
 
 QUERY_GROUP_ID = _parse_chat_id(os.getenv("QUERY_GROUP_ID") or os.getenv("QUERY_ADMIN_GC"))
+GROUP_LINK: str = os.getenv("GROUP_LINK", "").strip()
+CHANNEL_LINK: str = os.getenv("CHANNEL_LINK", "").strip()
+CHANNEL_ID = _parse_chat_id(os.getenv("CHANNEL_ID", "") or CHANNEL_LINK)
 
 GAME_NAME = "Dragon Ball: Multiverse Legends"
 GAME_VERSION = "2.1.0"

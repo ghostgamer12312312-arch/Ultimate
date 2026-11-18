@@ -15,7 +15,15 @@ from pathlib import Path
 from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, RetryAfter, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 try:
     from . import battle, config, data, game, ui
@@ -195,6 +203,9 @@ async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict | No
     player = db.ensure_player(user.id, user.username, user.first_name)
     if player.get("banned") and not config.is_admin(user.id):
         await respond(update, "🚫 <b>You are banned from this bot.</b>")
+        return None
+    if db.setting_get("maintenance", "off") == "on" and not db.is_admin(user.id):
+        await respond(update, "🛠 <b>The bot is under maintenance.</b>\nPlease try again shortly.")
         return None
     return player
 
@@ -609,6 +620,12 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Series: Dragon Ball • Naruto • Bleach • Jujutsu Kaisen • Tempest\n"
         f"Built for async Telegram with SQLite persistence."
     )
+    if config.GROUP_LINK or config.CHANNEL_LINK:
+        text += "\n\n🌐 <b>COMMUNITY</b>"
+        if config.GROUP_LINK:
+            text += f"\n💬 Group: {ui.esc(config.GROUP_LINK)}"
+        if config.CHANNEL_LINK:
+            text += f"\n📢 Channel: {ui.esc(config.CHANNEL_LINK)}"
     await respond(update, text, ui.back_keyboard())
 
 
@@ -1652,7 +1669,7 @@ async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category
         daily_buttons = []
         for offer in offers:
             lines.append(f"{offer['slot']}. {offer['emoji']} <b>{ui.esc(offer['name'])}</b> — {ui.fmt(offer['price'])} {offer['currency']} (-{int(offer['discount'] * 100)}%)")
-            daily_buttons.append(InlineKeyboardButton(f"{offer['emoji']} {offer['name']} • {ui.fmt(offer['price'])}", callback_data=f"shop:dailybuy:{offer['slot']}"))
+            daily_buttons.append(InlineKeyboardButton(f"{offer['emoji']} {ui.trim(offer['name'], 18)} • {ui.fmt(offer['price'])}", callback_data=f"shop:dailybuy:{offer['slot']}"))
         for index in range(0, len(daily_buttons), 2):
             rows.append(daily_buttons[index:index + 2])
         rows.extend(ui.shop_keyboard().inline_keyboard)
@@ -1674,7 +1691,7 @@ async def shop_view(update: Update, context: ContextTypes.DEFAULT_TYPE, category
         lines.append(f"{entry['emoji']} <b>{ui.esc(entry['name'])}</b> — {ui.fmt(entry['price'])} {entry['currency']} • <code>{entry['id']}</code>")
     lines.append("\nTap an item to choose quantity, or use /buy &lt;id&gt; [qty].")
     rows = []
-    shop_buttons = [InlineKeyboardButton(f"{entry['emoji']} {entry['name']} • {ui.fmt(entry['price'])}", callback_data=f"shop:item:{entry['id']}:{category}:{page}") for entry in page_entries]
+    shop_buttons = [InlineKeyboardButton(f"{entry['emoji']} {ui.trim(entry['name'], 18)} • {ui.fmt(entry['price'])}", callback_data=f"shop:item:{entry['id']}:{category}:{page}") for entry in page_entries]
     for index in range(0, len(shop_buttons), 2):
         rows.append(shop_buttons[index:index + 2])
     nav = []
@@ -4025,61 +4042,609 @@ async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await respond(update, "\n".join(lines), ui.back_keyboard("menu:profile"))
 
 
+ADMIN_PENDING_KEY = "admin_pending"
+ADMIN_BACK = "admin:menu"
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = context.user_data.pop(ADMIN_PENDING_KEY, None)
+    if pending:
+        await respond(update, "✅ Cancelled.", admin_panel_keyboard())
+        return
+    await respond(update, "Nothing to cancel.", ui.back_keyboard("menu:main"))
+
+
+def _human_size(size: int) -> str:
+    value = float(max(0, int(size)))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def _admin_name(update: Update) -> str:
+    user = update.effective_user
+    if user is None:
+        return "admin"
+    return user.username or user.first_name or str(user.id)
+
+
+def _admin_log(update: Update, db: Database, action: str, target_id=None, target_name="", detail="") -> None:
+    user = update.effective_user
+    db.admin_log(
+        user.id if user else 0,
+        action,
+        target_id,
+        target_name,
+        detail,
+        admin_name=_admin_name(update),
+    )
+
+
+def _admin_pending(context: ContextTypes.DEFAULT_TYPE, action: str, **extra) -> None:
+    context.user_data[ADMIN_PENDING_KEY] = {"action": action, **extra}
+
+
+def _admin_prompt_text(action: str, hint: str) -> str:
+    return (
+        "🛠 <b>ADMIN ACTION</b>\n\n"
+        f"{hint}\n\n"
+        "Type <code>/cancel</code> to abort."
+    )
+
+
 def admin_panel_text(db: Database) -> str:
     stats = db.query_stats()
+    maintenance = db.setting_get("maintenance", "off") == "on"
+    codes = db.redeem_codes_list(1)
     return (
-        "🛠 <b>ADMIN CONTROL PANEL</b>\n\n"
-        f"👥 Players: <b>{db.player_count()}</b> • 🏯 Clans: <b>{len(db.clan_leaderboard(999))}</b>\n"
+        "🛠 <b>ADMIN CONTROL PANEL</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Players: <b>{ui.fmt(db.player_count())}</b> • 🚫 Banned: <b>{db.banned_count()}</b>\n"
+        f"🏯 Clans: <b>{len(db.clan_leaderboard(999))}</b> • ⚔️ Active battles: <b>{db.active_battle_count()}</b>\n"
         f"🎫 Queries: <b>{stats.get('open', 0)}</b> open • <b>{stats.get('answered', 0)}</b> answered\n"
-        f"🛡 Admins: <b>{len(db.admins())}</b> dynamic + <b>{len(config.OWNER_IDS)}</b> owners\n\n"
-        "<b>➕ GRANT</b>\n"
-        "/admin add &lt;user&gt; &lt;kind&gt; &lt;value&gt; [qty]\n"
-        "Kinds: yens, gems, crystals, tickets, stamina, skill_points, exp, level, character, gear, item, pet, shard, title, everything\n\n"
-        "<b>➖ REMOVE / SET</b>\n"
-        "/admin remove &lt;user&gt; &lt;kind&gt; &lt;value&gt; [qty]\n"
-        "/admin set &lt;user&gt; &lt;yens|gems|crystals|tickets|stamina|skill_points|level|exp&gt; &lt;value&gt;\n\n"
-        "<b>🛡 MODERATION</b>\n"
-        "/admin heal|ban|unban|reset &lt;user&gt; • /setlevel &lt;user&gt; &lt;level&gt;\n\n"
-        "<b>🛡 ADMIN TEAM (OWNER)</b>\n"
-        "/admin admins • /admin addadmin &lt;user&gt; • /admin removeadmin &lt;user&gt;\n\n"
-        "<i>Targets work with numeric IDs, @usernames, or by replying to a player.</i>"
+        f"🎟️ Latest code: <b>{ui.esc(codes[0]['code']) if codes else 'None'}</b>\n"
+        f"🗄️ Database: <b>{_human_size(db.db_size_bytes())}</b>\n"
+        f"🔧 Maintenance: <b>{'ON' if maintenance else 'OFF'}</b>\n"
+        f"🛡 Admins: <b>{len(db.admins())}</b> dynamic + <b>{len(config.OWNER_IDS)}</b> owners\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Select a section below."
     )
+
+
+def _admin_back(target: str = ADMIN_BACK) -> list:
+    return [InlineKeyboardButton("⬅️ Back", callback_data=target)]
 
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎫 Queries", callback_data="admin:queries"), InlineKeyboardButton("🛡 Admins", callback_data="admin:admins")],
-        [InlineKeyboardButton("📊 Refresh", callback_data="admin:menu"), InlineKeyboardButton("💾 Backup", callback_data="admin:backup")],
-        [InlineKeyboardButton("📢 Broadcast Help", callback_data="admin:broadcast"), InlineKeyboardButton("❌ Close", callback_data="menu:main")],
+        [InlineKeyboardButton("👥 Users", callback_data="admin:users"), InlineKeyboardButton("🎁 Rewards", callback_data="admin:rewards")],
+        [InlineKeyboardButton("🛡 Moderation", callback_data="admin:moderation"), InlineKeyboardButton("⚔️ Battles", callback_data="admin:battles")],
+        [InlineKeyboardButton("🎟️ Codes", callback_data="admin:codes"), InlineKeyboardButton("📊 Stats", callback_data="admin:stats")],
+        [InlineKeyboardButton("🧾 Logs", callback_data="admin:logs"), InlineKeyboardButton("🔧 Maintenance", callback_data="admin:maint")],
+        [InlineKeyboardButton("📢 Channel", callback_data="admin:chan"), InlineKeyboardButton("👑 Owner Tools", callback_data="admin:owner")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin:menu"), InlineKeyboardButton("❌ Close", callback_data="menu:main")],
     ])
+
+
+def admin_channel_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("📝 Announce Text", callback_data="admin:prompt:announce")],
+        [InlineKeyboardButton("🖼️ Photo + Caption", callback_data="admin:prompt:announcephoto")],
+    ]
+    if config.CHANNEL_LINK:
+        rows.append([InlineKeyboardButton("📢 Open Channel", url=config.CHANNEL_LINK)])
+    rows.append(_admin_back("admin:menu"))
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_users_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Lookup", callback_data="admin:prompt:lookup"), InlineKeyboardButton("🚫 Ban", callback_data="admin:prompt:ban")],
+        [InlineKeyboardButton("✅ Unban", callback_data="admin:prompt:unban"), InlineKeyboardButton("💚 Heal", callback_data="admin:prompt:heal")],
+        [InlineKeyboardButton("♻️ Reset", callback_data="admin:prompt:reset"), InlineKeyboardButton("⬆️ Set Level", callback_data="admin:prompt:setlevel")],
+        [InlineKeyboardButton("➕ Add Money", callback_data="admin:prompt:grant:yens"), InlineKeyboardButton("➖ Remove Money", callback_data="admin:prompt:remove:yens")],
+        [InlineKeyboardButton("🎁 Give Item", callback_data="admin:prompt:grantitem"), InlineKeyboardButton("🎴 Give Hero", callback_data="admin:prompt:grantchar")],
+        [InlineKeyboardButton("⚙️ Give Gear", callback_data="admin:prompt:grantgear"), InlineKeyboardButton("🐾 Give Pet", callback_data="admin:prompt:grantpet")],
+        [InlineKeyboardButton("🚫 Banned List", callback_data="admin:banned")],
+        _admin_back("admin:menu"),
+    ])
+
+
+def admin_rewards_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💠 Yens", callback_data="admin:prompt:grant:yens"), InlineKeyboardButton("💎 Gems", callback_data="admin:prompt:grant:gems")],
+        [InlineKeyboardButton("🔮 Crystals", callback_data="admin:prompt:grant:crystals"), InlineKeyboardButton("🎟️ Tickets", callback_data="admin:prompt:grant:tickets")],
+        [InlineKeyboardButton("⚡ Stamina", callback_data="admin:prompt:grant:stamina"), InlineKeyboardButton("🧠 Skill Pts", callback_data="admin:prompt:grant:skill_points")],
+        [InlineKeyboardButton("✨ EXP", callback_data="admin:prompt:setexp"), InlineKeyboardButton("⬆️ Level", callback_data="admin:prompt:setlevel")],
+        [InlineKeyboardButton("🎁 Item", callback_data="admin:prompt:grantitem"), InlineKeyboardButton("🎴 Hero", callback_data="admin:prompt:grantchar")],
+        [InlineKeyboardButton("⚙️ Gear", callback_data="admin:prompt:grantgear"), InlineKeyboardButton("🐾 Pet", callback_data="admin:prompt:grantpet")],
+        _admin_back("admin:menu"),
+    ])
+
+
+def admin_moderation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 Ban", callback_data="admin:prompt:ban"), InlineKeyboardButton("✅ Unban", callback_data="admin:prompt:unban")],
+        [InlineKeyboardButton("💚 Heal", callback_data="admin:prompt:heal"), InlineKeyboardButton("♻️ Reset Player", callback_data="admin:prompt:reset")],
+        [InlineKeyboardButton("🚫 Banned List", callback_data="admin:banned")],
+        _admin_back("admin:menu"),
+    ])
+
+
+def admin_battles_keyboard(db: Database) -> InlineKeyboardMarkup:
+    rows = []
+    for battle in db.active_battle_users(8):
+        name = ui.esc(str(battle["user_id"]))
+        title = ui.esc(str(battle.get("title") or battle.get("mode") or "Battle"))
+        rows.append([InlineKeyboardButton(f"🛑 {name} — {title[:18]}", callback_data=f"admin:endbattle:{int(battle['user_id'])}")])
+    rows.append([InlineKeyboardButton("🧹 Clear All Battles", callback_data="admin:clearbattles")])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="admin:battles")])
+    rows.append(_admin_back("admin:menu"))
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_codes_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Create Code", callback_data="admin:prompt:code"), InlineKeyboardButton("🗑️ Expire Code", callback_data="admin:prompt:expire")],
+        [InlineKeyboardButton("📜 Active Codes", callback_data="admin:codelist"), InlineKeyboardButton("📊 Code Stats", callback_data="admin:codestats")],
+        _admin_back("admin:menu"),
+    ])
+
+
+def admin_maint_keyboard(db: Database) -> InlineKeyboardMarkup:
+    maintenance = db.setting_get("maintenance", "off") == "on"
+    toggle = "🔓 Disable Maintenance" if maintenance else "🔒 Enable Maintenance"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle, callback_data="admin:togglemaint")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin:prompt:broadcast"), InlineKeyboardButton("💾 Backup Now", callback_data="admin:backup")],
+        [InlineKeyboardButton("🗄️ DB Info", callback_data="admin:dbinfo"), InlineKeyboardButton("📊 Stats", callback_data="admin:stats")],
+        _admin_back("admin:menu"),
+    ])
+
+
+def admin_owner_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Admin", callback_data="admin:prompt:addadmin"), InlineKeyboardButton("➖ Remove Admin", callback_data="admin:prompt:removeadmin")],
+        [InlineKeyboardButton("👑 Admin List", callback_data="admin:ownerlist")],
+        _admin_back("admin:menu"),
+    ])
+
+
+def _admin_stats_text(db: Database) -> str:
+    stats = db.query_stats()
+    return (
+        "📊 <b>BOT STATISTICS</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Players: <b>{ui.fmt(db.player_count())}</b>\n"
+        f"🚫 Banned: <b>{db.banned_count()}</b>\n"
+        f"🏯 Clans: <b>{len(db.clan_leaderboard(999))}</b>\n"
+        f"⚔️ Active battles: <b>{db.active_battle_count()}</b>\n"
+        f"🎟️ Redeem codes: <b>{len(db.redeem_codes_list(1000))}</b>\n"
+        f"🎫 Queries: <b>{stats.get('open', 0)}</b> open • <b>{stats.get('answered', 0)}</b> answered • <b>{stats.get('total', 0)}</b> total\n"
+        f"🛡 Admins: <b>{len(db.admins())}</b> dynamic + <b>{len(config.OWNER_IDS)}</b> owners\n"
+        f"🗄️ Database size: <b>{_human_size(db.db_size_bytes())}</b>"
+    )
+
+
+def _admin_logs_text(db: Database) -> str:
+    logs = db.admin_logs(12)
+    lines = ["🧾 <b>ADMIN LOGS</b>", "━━━━━━━━━━━━━━━━━━"]
+    if not logs:
+        lines.append("No admin actions logged yet.")
+    else:
+        for row in logs:
+            actor = row.get("admin_name") or row.get("admin_id")
+            target = f" → {row.get('target_name') or row.get('target_id')}" if (row.get("target_id") or row.get("target_name")) else ""
+            detail = f" ({row.get('detail')})" if row.get("detail") else ""
+            lines.append(f"• <b>{ui.esc(row['action'])}</b> by {ui.esc(str(actor))}{ui.esc(target)}{ui.esc(detail)}")
+            lines.append(f"  <i>{ui.esc(str(row.get('created_at', '')))}</i>")
+    return "\n".join(lines)
+
+
+async def _show_admin_battles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db = get_db(context)
+    battles = db.active_battle_users(8)
+    lines = ["⚔️ <b>ACTIVE BATTLES</b>", "━━━━━━━━━━━━━━━━━━"]
+    if not battles:
+        lines.append("No active battles right now.")
+    else:
+        for row in battles:
+            lines.append(
+                f"• <code>{int(row['user_id'])}</code> — {ui.esc(str(row.get('title') or row.get('mode')))} "
+                f"<i>({ui.esc(str(row.get('updated_at', '')))})</i>"
+            )
+    await respond(update, "\n".join(lines), admin_battles_keyboard(db))
+
+
+async def _show_admin_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db = get_db(context)
+    codes = db.redeem_codes_list(15)
+    lines = ["🎟️ <b>REDEEM CODES</b>", "━━━━━━━━━━━━━━━━━━"]
+    if not codes:
+        lines.append("No redeem codes created yet.")
+    else:
+        for row in codes:
+            state = "🟢" if int(row.get("used_count", 0)) < int(row.get("max_uses", 0)) else "🔴"
+            lines.append(
+                f"{state} <code>{ui.esc(row['code'])}</code> — "
+                f"{int(row.get('used_count', 0))}/{int(row.get('max_uses', 0))} used"
+            )
+    await respond(update, "\n".join(lines), admin_codes_keyboard())
 
 
 async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]) -> None:
     db = get_db(context)
     action = parts[1] if len(parts) > 1 else "menu"
+    user = update.effective_user
     if action == "menu":
         await respond(update, admin_panel_text(db), admin_panel_keyboard())
         return
-    if action == "queries":
-        context.args = ["list"]
-        await cmd_admin_query(update, context)
+    if action == "users":
+        await respond(update, "👥 <b>USER MANAGEMENT</b>\nTargets: numeric ID, @username, or open the matching prompt.", admin_users_keyboard())
+        return
+    if action == "rewards":
+        await respond(update, "🎁 <b>REWARDS &amp; ECONOMY</b>\nPick what to grant; then send <code>target amount</code>.", admin_rewards_keyboard())
+        return
+    if action == "moderation":
+        await respond(update, "🛡 <b>MODERATION</b>\nPick an action; then send the target player.", admin_moderation_keyboard())
+        return
+    if action == "battles":
+        await _show_admin_battles(update, context)
+        return
+    if action == "codes":
+        await respond(update, "🎟️ <b>REDEEM CODES</b>\nCreate codes, list them, or expire one.", admin_codes_keyboard())
+        return
+    if action == "stats":
+        await respond(update, _admin_stats_text(db), ui.back_keyboard("admin:menu"))
+        return
+    if action == "logs":
+        await respond(update, _admin_logs_text(db), ui.back_keyboard("admin:menu"))
+        return
+    if action == "chan":
+        channel = ui.esc(config.CHANNEL_LINK or "not linked")
+        await respond(
+            update,
+            "📢 <b>CHANNEL POSTING</b>\n"
+            f"{channel}\n\n"
+            "Post text or a photo with caption directly to the official channel using the bot.",
+            admin_channel_keyboard(),
+        )
+        return
+    if action == "maint":
+        await respond(update, "🔧 <b>MAINTENANCE</b>\nToggle maintenance, broadcast, back up the database and clear caches.", admin_maint_keyboard(db))
+        return
+    if action == "owner":
+        if user is None or not config.is_admin(user.id):
+            await respond(update, "⛔ Owner only.", ui.back_keyboard("admin:menu"))
+            return
+        await respond(update, "👑 <b>OWNER TOOLS</b>\nManage the admin team.", admin_owner_keyboard())
+        return
+    if action == "ownerlist":
+        owners = [str(uid) for uid in config.OWNER_IDS]
+        dynamic = [str(uid) for uid in db.admins()]
+        await respond(
+            update,
+            "🛡 <b>ADMIN TEAM</b>\n\n"
+            f"👑 Owners: <code>{', '.join(owners) or 'None'}</code>\n"
+            f"🛠 Dynamic: <code>{', '.join(dynamic) or 'None'}</code>",
+            admin_owner_keyboard(),
+        )
+        return
+    if action == "banned":
+        banned = db.banned_players(25)
+        lines = ["🚫 <b>BANNED PLAYERS</b>", "━━━━━━━━━━━━━━━━━━"]
+        if not banned:
+            lines.append("Nobody is banned.")
+        else:
+            for row in banned:
+                lines.append(f"• <code>{int(row['user_id'])}</code> — {ui.esc(display_name(row, str(row['user_id'])))} Lv.{row.get('level', 1)}")
+        await respond(update, "\n".join(lines), ui.back_keyboard("admin:moderation"))
+        return
+    if action == "codelist":
+        await _show_admin_codes(update, context)
+        return
+    if action == "codestats":
+        codes = db.redeem_codes_list(1000)
+        issued = sum(int(row.get("max_uses", 0)) for row in codes)
+        used = sum(int(row.get("used_count", 0)) for row in codes)
+        await respond(
+            update,
+            "📊 <b>CODE STATS</b>\n\n"
+            f"🎟️ Codes: <b>{len(codes)}</b>\n"
+            f"🎁 Slots issued: <b>{ui.fmt(issued)}</b>\n"
+            f"✅ Redeemed: <b>{ui.fmt(used)}</b>",
+            ui.back_keyboard("admin:codes"),
+        )
         return
     if action == "backup":
         context.args = []
         await cmd_backup(update, context)
         return
-    if action == "broadcast":
-        await respond(update, "📢 <b>BROADCAST</b>\n\nUse <code>/broadcast your message</code> to DM every player.", ui.back_keyboard("admin:menu"))
+    if action == "dbinfo":
+        await respond(
+            update,
+            "🗄️ <b>DATABASE INFO</b>\n\n"
+            f"Path: <code>{ui.esc(db.path)}</code>\n"
+            f"Size: <b>{_human_size(db.db_size_bytes())}</b>\n"
+            f"Players: <b>{ui.fmt(db.player_count())}</b>\n"
+            f"Active battles: <b>{db.active_battle_count()}</b>",
+            ui.back_keyboard("admin:maint"),
+        )
         return
-    if action == "admins":
-        owners = [str(uid) for uid in config.OWNER_IDS]
-        dynamic = [str(uid) for uid in db.admins()]
-        await respond(update, "🛡 <b>ADMIN TEAM</b>\n\n"
-                        f"👑 Owners: <code>{', '.join(owners) or 'None'}</code>\n"
-                        f"🛠 Dynamic: <code>{', '.join(dynamic) or 'None'}</code>\n\n"
-                        "Owner tools:\n/admin addadmin &lt;id|@user&gt;\n/admin removeadmin &lt;id|@user&gt;", ui.back_keyboard("admin:menu"))
+    if action == "togglemaint":
+        if user is None or not config.is_admin(user.id):
+            return
+        new_value = "off" if db.setting_get("maintenance", "off") == "on" else "on"
+        db.setting_set("maintenance", new_value)
+        _admin_log(update, db, "maintenance", detail=new_value)
+        await respond(update, f"🔧 Maintenance is now <b>{new_value.upper()}</b>.", admin_maint_keyboard(db))
+        return
+    if action == "clearbattles":
+        count = 0
+        for row in db.active_battle_users(1000):
+            db.clear_battle(int(row["user_id"]))
+            count += 1
+        _admin_log(update, db, "clear_battles", detail=str(count))
+        await respond(update, f"🧹 Cleared <b>{count}</b> active battles.", admin_battles_keyboard(db))
+        return
+    if action == "endbattle":
+        target_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        if target_id:
+            db.clear_battle(target_id)
+            _admin_log(update, db, "end_battle", target_id)
+        await _show_admin_battles(update, context)
+        return
+    if action == "prompt":
+        if len(parts) < 3:
+            await respond(update, admin_panel_text(db), admin_panel_keyboard())
+            return
+        prompt = parts[2]
+        extra = parts[3] if len(parts) > 3 else None
+        hints = {
+            "lookup": "Send: <code>&lt;user_id|@username&gt;</code>",
+            "ban": "Send: <code>&lt;user_id|@username&gt;</code>",
+            "unban": "Send: <code>&lt;user_id|@username&gt;</code>",
+            "heal": "Send: <code>&lt;user_id|@username&gt;</code>",
+            "reset": "Send: <code>&lt;user_id|@username&gt;</code>",
+            "setlevel": "Send: <code>&lt;user_id|@username&gt; &lt;level 1-100&gt;</code>",
+            "setexp": "Send: <code>&lt;user_id|@username&gt; &lt;amount&gt;</code>",
+            "grantitem": "Send: <code>&lt;user_id|@username&gt; &lt;item_id&gt; [qty]</code>",
+            "grantchar": "Send: <code>&lt;user_id|@username&gt; &lt;hero name or id&gt;</code>",
+            "grantgear": "Send: <code>&lt;user_id|@username&gt; &lt;gear name or id&gt; [level]</code>",
+            "grantpet": "Send: <code>&lt;user_id|@username&gt; &lt;pet name or id&gt;</code>",
+            "addadmin": "Send: <code>&lt;user_id|@username&gt;</code>",
+            "removeadmin": "Send: <code>&lt;user_id|@username&gt;</code>",
+            "endbattle": "Send: <code>&lt;user_id&gt;</code>",
+            "expire": "Send the code to expire: <code>CODE</code>",
+            "code": "Send: <code>CODE rewards [uses=100]</code>\nExample: <code>WELCOME gems:500,yens:5000 uses=100</code>",
+            "broadcast": "Send the announcement text. It is DM'd to every player.",
+            "announce": "Send the text to post on the official channel.",
+            "announcephoto": "Send the photo now, with a caption if you want one.",
+        }
+        hint = hints.get(prompt, "Send the value.")
+        if prompt == "grant":
+            kind = extra or "yens"
+            hint = f"Send: <code>&lt;user_id|@username&gt; &lt;amount&gt;</code> — granting <b>{kind}</b>."
+            _admin_pending(context, "grant", kind=kind)
+        elif prompt == "remove":
+            kind = extra or "yens"
+            hint = f"Send: <code>&lt;user_id|@username&gt; &lt;amount&gt;</code> — removing <b>{kind}</b>."
+            _admin_pending(context, "remove", kind=kind)
+        else:
+            _admin_pending(context, prompt)
+        await respond(update, _admin_prompt_text(prompt, hint), ui.back_keyboard("admin:menu"))
         return
     await respond(update, admin_panel_text(db), admin_panel_keyboard())
+
+
+async def handle_admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = context.user_data.get(ADMIN_PENDING_KEY)
+    if not pending:
+        return
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        context.user_data.pop(ADMIN_PENDING_KEY, None)
+        return
+    db = get_db(context)
+    if not db.is_admin(user.id):
+        context.user_data.pop(ADMIN_PENDING_KEY, None)
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+    context.user_data.pop(ADMIN_PENDING_KEY, None)
+    if text.lower() in ("/cancel", "cancel"):
+        await respond(update, "✅ Cancelled.", admin_panel_keyboard())
+        raise ApplicationHandlerStop
+    action = pending.get("action", "")
+    tokens = text.split()
+    try:
+        if action == "broadcast":
+            sent = failed = 0
+            for row in db.all_players(100000):
+                try:
+                    await context.bot.send_message(
+                        row["user_id"],
+                        f"📢 <b>ANNOUNCEMENT</b>\n\n{ui.esc(text)}",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    sent += 1
+                except TelegramError:
+                    failed += 1
+            _admin_log(update, db, "broadcast", detail=f"{sent} sent / {failed} failed")
+            await respond(update, f"📢 Sent to <b>{sent}</b> players. Failed: <b>{failed}</b>.", admin_panel_keyboard())
+            raise ApplicationHandlerStop
+        if action == "code":
+            code = tokens[0] if tokens else ""
+            rewards, options, error = _parse_redeem_rewards(tokens[1:])
+            if error:
+                await respond(update, f"❌ {ui.esc(error)}", admin_codes_keyboard())
+                raise ApplicationHandlerStop
+            expires_at = None
+            if options.get("days"):
+                expires_at = (datetime.utcnow() + timedelta(days=options["days"])).isoformat(timespec="seconds")
+            result = db.redeem_code_create(user.id, code, rewards, options.get("uses", 1), expires_at)
+            if not result["ok"]:
+                await respond(update, f"❌ {ui.esc(result['reason'])}", admin_codes_keyboard())
+                raise ApplicationHandlerStop
+            _admin_log(update, db, "create_code", detail=result["code"])
+            await respond(
+                update,
+                f"✅ Code <code>{ui.esc(result['code'])}</code> created with <b>{result['max_uses']}</b> uses.",
+                admin_codes_keyboard(),
+            )
+            raise ApplicationHandlerStop
+        if action == "expire":
+            code = (tokens[0] if tokens else "").upper()
+            if db.expire_code(code):
+                _admin_log(update, db, "expire_code", detail=code)
+                await respond(update, f"🗑️ Code <code>{ui.esc(code)}</code> expired.", admin_codes_keyboard())
+            else:
+                await respond(update, "❌ Code not found.", admin_codes_keyboard())
+            raise ApplicationHandlerStop
+        if action == "announcephoto":
+            _admin_pending(context, "announcephoto")
+            await respond(update, "🖼️ Please send the photo now, with a caption if you want one.", admin_channel_keyboard())
+            raise ApplicationHandlerStop
+        if action == "announce":
+            ok, error = await _post_to_channel(context, ui.esc(text))
+            if not ok:
+                await respond(update, f"❌ Channel post failed: {ui.esc(error)}", admin_channel_keyboard())
+            else:
+                _admin_log(update, db, "channel_announce", detail=text[:120])
+                await respond(update, "✅ Announcement posted to the channel.", admin_channel_keyboard())
+            raise ApplicationHandlerStop
+        target = db.find_player(tokens[0]) if tokens else None
+        if target is None:
+            await respond(update, "❌ Player not found. Use numeric ID or @username.", admin_panel_keyboard())
+            raise ApplicationHandlerStop
+        target_id = int(target["user_id"])
+        target_name = display_name(target, str(target_id))
+        if action == "lookup":
+            _admin_log(update, db, "lookup", target_id, target_name)
+            await respond(
+                update,
+                "🔎 <b>PLAYER LOOKUP</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>{ui.esc(target_name)}</b> • <code>{target_id}</code>\n"
+                f"🏅 {ui.esc(str(target.get('rank', 'Rookie')))} • Lv.{target.get('level', 1)}\n"
+                f"💠 {ui.fmt(target.get('yens', 0))} • 💎 {ui.fmt(target.get('gems', 0))} • 🔮 {ui.fmt(target.get('crystals', 0))} • 🎟️ {target.get('tickets', 0)}\n"
+                f"⚡ {target.get('stamina', 0)}/{target.get('max_stamina', 0)} • 🚫 Banned: <b>{'yes' if target.get('banned') else 'no'}</b>\n"
+                f"🎴 Heroes: <b>{len(db.characters(target_id))}</b> • 🏯 Clan: <b>{ui.esc((db.clan(target_id) or {}).get('name', 'None'))}</b>",
+                admin_users_keyboard(),
+            )
+            raise ApplicationHandlerStop
+        if action in ("ban", "unban"):
+            if action == "ban" and db.is_admin(target_id) and target_id != user.id:
+                await respond(update, "❌ You cannot ban another admin.", admin_moderation_keyboard())
+                raise ApplicationHandlerStop
+            db.ban(target_id, action == "ban")
+            _admin_log(update, db, action, target_id, target_name)
+            await respond(update, f"{'🚫 Banned' if action == 'ban' else '✅ Unbanned'} <b>{ui.esc(target_name)}</b>.", admin_moderation_keyboard())
+            raise ApplicationHandlerStop
+        if action == "heal":
+            stats = game.effective_stats(db, target_id)
+            db.set_vitals(target_id, hp=stats["hp"], mp=stats["max_mp"])
+            _admin_log(update, db, "heal", target_id, target_name)
+            await respond(update, f"💚 Fully healed <b>{ui.esc(target_name)}</b>.", admin_moderation_keyboard())
+            raise ApplicationHandlerStop
+        if action == "reset":
+            db.reset_player(target_id)
+            _admin_log(update, db, "reset_player", target_id, target_name)
+            await respond(update, f"♻️ Reset <b>{ui.esc(target_name)}</b>.", admin_moderation_keyboard())
+            raise ApplicationHandlerStop
+        if action == "setlevel":
+            level = int(tokens[1]) if len(tokens) > 1 and tokens[1].lstrip("-").isdigit() else 0
+            level = max(1, min(100, level))
+            db.set_field(target_id, "level", level)
+            db.set_field(target_id, "rank", data.rank_for_level(level)["name"])
+            _admin_log(update, db, "set_level", target_id, target_name, str(level))
+            await respond(update, f"⬆️ Set <b>{ui.esc(target_name)}</b> to level <b>{level}</b>.", admin_rewards_keyboard())
+            raise ApplicationHandlerStop
+        if action == "setexp":
+            amount = int(tokens[1]) if len(tokens) > 1 and tokens[1].isdigit() else 0
+            db.set_field(target_id, "exp", amount)
+            _admin_log(update, db, "set_exp", target_id, target_name, str(amount))
+            await respond(update, f"✨ Set EXP of <b>{ui.esc(target_name)}</b> to <b>{ui.fmt(amount)}</b>.", admin_rewards_keyboard())
+            raise ApplicationHandlerStop
+        if action == "endbattle":
+            db.clear_battle(target_id)
+            _admin_log(update, db, "end_battle", target_id, target_name)
+            await respond(update, f"🛑 Ended the active battle for <b>{ui.esc(target_name)}</b>.", admin_battles_keyboard(db))
+            raise ApplicationHandlerStop
+        if action in ("addadmin", "removeadmin"):
+            if not config.is_admin(user.id):
+                await respond(update, "⛔ Owner only.", admin_panel_keyboard())
+                raise ApplicationHandlerStop
+            if action == "addadmin":
+                db.add_admin(target_id, user.id)
+                message_text = f"👑 Added <b>{ui.esc(target_name)}</b> to the admin team."
+            else:
+                removed = db.remove_admin(target_id)
+                message_text = f"👑 Removed <b>{ui.esc(target_name)}</b> from the admin team." if removed else "❌ That player is not a dynamic admin."
+            _admin_log(update, db, action, target_id, target_name)
+            await respond(update, message_text, admin_owner_keyboard())
+            raise ApplicationHandlerStop
+        if action in ("grant", "remove", "grantitem", "grantchar", "grantgear", "grantpet"):
+            kind = pending.get("kind") or {
+                "grantitem": "item", "grantchar": "character", "grantgear": "gear", "grantpet": "pet",
+            }.get(action, "yens")
+            value = tokens[1] if len(tokens) > 1 else ""
+            qty = int(tokens[2]) if len(tokens) > 2 and tokens[2].isdigit() else 1
+            if kind in ("yens", "gems", "crystals", "tickets", "stamina", "skill_points"):
+                amount = int(value) if value.lstrip("-").isdigit() else 0
+                if action == "remove":
+                    result = db.remove_asset(target_id, kind, amount, 1)
+                else:
+                    result = db.grant_asset(target_id, kind, amount, 1)
+            elif kind == "character":
+                character = resolve_any_character(value)
+                result = db.grant_asset(target_id, "character", character["id"], qty) if character else {"ok": False, "reason": "Unknown character."}
+            elif kind == "gear":
+                gear = data.GEAR.get(value) or next((item for item in data.GEAR.values() if value.lower() in item["name"].lower()), None)
+                result = db.grant_asset(target_id, "gear", gear["id"], qty) if gear else {"ok": False, "reason": "Unknown gear."}
+            elif kind == "pet":
+                pet = data.PETS.get(value) or next((item for item in data.PETS.values() if value.lower() in item["name"].lower()), None)
+                result = db.grant_asset(target_id, "pet", pet["id"], qty) if pet else {"ok": False, "reason": "Unknown companion."}
+            else:
+                result = db.grant_asset(target_id, "item", value, qty)
+            if not result.get("ok"):
+                await respond(update, f"❌ {ui.esc(result.get('reason', 'Action failed.'))}", admin_panel_keyboard())
+                raise ApplicationHandlerStop
+            _admin_log(update, db, action, target_id, target_name, f"{kind} {value} x{qty}")
+            await respond(update, f"✅ {ui.esc(result.get('message', 'Done.'))}\n👤 <b>{ui.esc(target_name)}</b>", admin_panel_keyboard())
+            raise ApplicationHandlerStop
+    except (ValueError, TypeError) as exc:
+        await respond(update, f"❌ Invalid input: {ui.esc(str(exc))}", admin_panel_keyboard())
+        raise ApplicationHandlerStop
+    await respond(update, admin_panel_text(db), admin_panel_keyboard())
+    raise ApplicationHandlerStop
+
+
+async def handle_admin_pending_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = context.user_data.get(ADMIN_PENDING_KEY)
+    if not pending or pending.get("action") != "announcephoto":
+        return
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None or not message.photo:
+        return
+    db = get_db(context)
+    if not db.is_admin(user.id):
+        context.user_data.pop(ADMIN_PENDING_KEY, None)
+        return
+    context.user_data.pop(ADMIN_PENDING_KEY, None)
+    caption = (message.caption or "").strip()
+    ok, error = await _post_to_channel(context, ui.esc(caption), photo=message.photo[-1].file_id)
+    if not ok:
+        await respond(update, f"❌ Channel post failed: {ui.esc(error)}", admin_channel_keyboard())
+    else:
+        _admin_log(update, db, "channel_photo", detail=caption[:120])
+        await respond(update, "✅ Photo posted to the channel.", admin_channel_keyboard())
+    raise ApplicationHandlerStop
 
 
 async def _admin_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict | None:
@@ -5005,6 +5570,73 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await respond(update, f"📢 Broadcast sent to {sent} players. Failed: {failed}.")
 
 
+async def _post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str = "", photo: str | None = None):
+    if not config.CHANNEL_ID:
+        return False, "CHANNEL_ID is not configured in .env."
+    try:
+        if photo:
+            await context.bot.send_photo(
+                chat_id=config.CHANNEL_ID,
+                photo=photo,
+                caption=text[:1024] or None,
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=config.CHANNEL_ID,
+                text=text[:4000],
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=False,
+            )
+        return True, ""
+    except TelegramError as exc:
+        logger.warning("Channel post failed: %s", exc)
+        return False, str(exc)
+
+
+async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    admin = await guard_admin(update, context)
+    if admin is None:
+        return
+    text = " ".join(context.args).strip()
+    if not text:
+        await respond(update, "Usage: <code>/announce your announcement text</code>")
+        return
+    ok, error = await _post_to_channel(context, ui.esc(text))
+    if not ok:
+        await respond(update, f"❌ Channel post failed: {ui.esc(error)}")
+        return
+    _admin_log(update, get_db(context), "channel_announce", detail=text[:120])
+    await respond(update, "✅ Announcement posted to the channel." + (f"\n{ui.esc(config.CHANNEL_LINK)}" if config.CHANNEL_LINK else ""))
+
+
+async def cmd_announcephoto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    admin = await guard_admin(update, context)
+    if admin is None:
+        return
+    message = update.effective_message
+    source = None
+    if message is not None and message.photo:
+        source = message
+    elif message is not None and message.reply_to_message is not None and message.reply_to_message.photo:
+        source = message.reply_to_message
+    if source is None:
+        await respond(
+            update,
+            "🖼️ <b>Channel Photo Post</b>\n\n"
+            "Reply to a photo with <code>/announcephoto your caption</code>,\n"
+            "or send a photo with that caption as its caption.",
+        )
+        return
+    caption = " ".join(context.args).strip() or (source.caption or "")
+    ok, error = await _post_to_channel(context, ui.esc(caption), photo=source.photo[-1].file_id)
+    if not ok:
+        await respond(update, f"❌ Channel post failed: {ui.esc(error)}")
+        return
+    _admin_log(update, get_db(context), "channel_photo", detail=caption[:120])
+    await respond(update, "✅ Photo posted to the channel." + (f"\n{ui.esc(config.CHANNEL_LINK)}" if config.CHANNEL_LINK else ""))
+
+
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     admin = await guard_admin(update, context)
     if admin is None:
@@ -5442,6 +6074,8 @@ async def _startup_welcome_broadcast(application: Application) -> None:
     db = application.bot_data.get("db")
     if db is None:
         return
+    if db.setting_get("startup_welcome_sent", "0") == "1":
+        return
     await asyncio.sleep(2)
     sent = failed = 0
     for player in db.all_players(0):
@@ -5479,6 +6113,7 @@ async def _startup_welcome_broadcast(application: Application) -> None:
         except TelegramError:
             failed += 1
         await asyncio.sleep(0.05)
+    db.setting_set("startup_welcome_sent", "1")
     logger.info("Startup welcome sent: %s delivered, %s failed", sent, failed)
 
 
@@ -5498,7 +6133,8 @@ async def post_init(application: Application) -> None:
             await asyncio.sleep(2)
     admin_ids = list(dict.fromkeys([*config.ADMIN_IDS, *db.admins()]))
     if admin_ids:
-        admin_commands = public_commands + [BotCommand(name, desc) for name, desc in ADMIN_COMMANDS]
+        visible_admin_commands = [entry for entry in ADMIN_COMMANDS if entry[0] not in ADMIN_HIDDEN_COMMANDS]
+        admin_commands = public_commands + [BotCommand(name, desc) for name, desc in visible_admin_commands]
         admin_commands = admin_commands[:100]
         for admin_id in admin_ids:
             for attempt in range(3):
@@ -5512,7 +6148,7 @@ async def post_init(application: Application) -> None:
                 except TelegramError as exc:
                     logger.warning("Could not set admin commands for %s (attempt %d): %s", admin_id, attempt + 1, exc)
                     await asyncio.sleep(2)
-    application.create_task(_startup_welcome_broadcast(application))
+    _spawn(_startup_welcome_broadcast(application))
     username = application.bot.username or "unknown"
     logger.info("Connected to Telegram as @%s", username)
 
@@ -5620,7 +6256,14 @@ ADMIN_COMMANDS: list[tuple[str, str]] = [
     ("ban", "Admin: ban player"),
     ("broadcast", "Admin: broadcast"),
     ("backup", "Admin: backup database"),
+    ("announce", "Admin: post to the channel"),
+    ("announcephoto", "Admin: post a photo to the channel"),
 ]
+
+ADMIN_HIDDEN_COMMANDS = {
+    "createcode", "admin", "grant", "ban", "broadcast", "backup",
+    "announce", "announcephoto",
+}
 
 HANDLERS = {
     "start": cmd_start,
@@ -5773,6 +6416,9 @@ HANDLERS = {
     "resetplayer": cmd_resetplayer,
     "broadcast": cmd_broadcast,
     "backup": cmd_backup,
+    "announce": cmd_announce,
+    "announcephoto": cmd_announcephoto,
+    "cancel": cmd_cancel,
 }
 
 
@@ -5838,6 +6484,26 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             player = await guard(update, context)
             if player:
                 await respond(update, main_menu_text(player), ui.main_menu_keyboard())
+        elif target == "more":
+            player = await guard(update, context)
+            if player:
+                await respond(
+                    update,
+                    "➕ <b>MORE ACTIONS</b>\n\nGather resources, track pity, swap elements or free yourself from a stuck state.",
+                    ui.more_keyboard(),
+                )
+        elif target == "links":
+            rows = []
+            if config.GROUP_LINK:
+                rows.append([InlineKeyboardButton("💬 Community Group", url=config.GROUP_LINK)])
+            if config.CHANNEL_LINK:
+                rows.append([InlineKeyboardButton("📢 Official Channel", url=config.CHANNEL_LINK)])
+            rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+            await respond(
+                update,
+                "🌐 <b>COMMUNITY</b>\n\nJoin the group for help and events, and follow the channel for updates, codes and new releases.",
+                InlineKeyboardMarkup(rows),
+            )
         elif target == "profile":
             await cmd_profile(update, context)
         elif target == "gacha":
@@ -6559,6 +7225,14 @@ def build_application() -> Application:
     for name, handler in HANDLERS.items():
         application.add_handler(CommandHandler(name, timed_handler(name, handler)))
     application.add_handler(CallbackQueryHandler(timed_handler("callback", callback_router)))
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        timed_handler("admin_pending", handle_admin_pending),
+    ), group=-1)
+    application.add_handler(MessageHandler(
+        filters.PHOTO,
+        timed_handler("admin_pending_photo", handle_admin_pending_photo),
+    ), group=-1)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         timed_handler("clan_manage_text", handle_clan_manage_input),

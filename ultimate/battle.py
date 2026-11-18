@@ -791,9 +791,9 @@ def render(battle: dict) -> str:
     meta = state["meta"]
     lines = [f"<b>{ui.esc(battle['title'])}</b>", ""]
     lines.append(f"👤 <b>{ui.esc(player['name'])}</b> Lv.{player['level']}")
-    lines.append(f"❤️ {ui.percent_bar(player['hp'], player['max_hp'], 12)} {ui.fmt(player['hp'])}/{ui.fmt(player['max_hp'])}")
-    lines.append(f"🔵 {ui.percent_bar(player['mp'], player['max_mp'], 12)} {ui.fmt(player['mp'])}/{ui.fmt(player['max_mp'])} MP")
-    lines.append(f"🌟 ULT {ui.percent_bar(state.get('ult', 0), 100, 10)} {state.get('ult', 0)}%")
+    lines.append(f"{ui.hearts(player['hp'], player['max_hp'], 10)} {ui.fmt(player['hp'])}/{ui.fmt(player['max_hp'])} HP")
+    lines.append(f"{ui.mana_bar(player['mp'], player['max_mp'], 10)} {ui.fmt(player['mp'])}/{ui.fmt(player['max_mp'])} MP")
+    lines.append(f"🌟 ULT {ui.bar(state.get('ult', 0), 100, 10)} {state.get('ult', 0)}%")
     if int(state.get("transform", 0)) > 0:
         lines.append(f"🔥 Transformation: <b>{state['transform']}</b> turns left")
     team = state.get("team") or []
@@ -805,10 +805,10 @@ def render(battle: dict) -> str:
     lines.append("")
     element = ELEMENT_EMOJI.get(enemy.get("element"), "🔮")
     lines.append(f"{element} <b>{ui.esc(enemy['name'])}</b> Lv.{enemy.get('level', 1)}")
-    lines.append(f"❤️ {ui.percent_bar(enemy['hp'], enemy['max_hp'], 12)} {ui.fmt(enemy['hp'])}/{ui.fmt(enemy['max_hp'])}")
+    lines.append(f"{ui.hearts(enemy['hp'], enemy['max_hp'], 10)} {ui.fmt(enemy['hp'])}/{ui.fmt(enemy['max_hp'])} HP")
     if meta.get("shared"):
         lines.append("💥 Damage this fight: <b>{}</b>".format(ui.fmt(meta.get("damage", 0))))
-    lines.append(f"🔄 Turn <b>{state.get('turn', 1)}</b>")
+    lines.append(f"🔄 Turn <b>{state.get('turn', 1)}</b> — <i>your move</i>")
     lines.append("")
     for entry in state.get("log", [])[-8:]:
         lines.append(f"• {ui.esc(entry)}")
@@ -878,8 +878,8 @@ def keyboard(battle: dict, potions: list[dict] | None = None):
         extra.append(InlineKeyboardButton("🔥 Transform", callback_data=f"btl:t:{bid}"))
     if len(state.get("team") or []) > 1:
         extra.append(InlineKeyboardButton("🔄 Switch", callback_data=f"btl:x:{bid}"))
-    if extra:
-        rows.append(extra)
+    for index in range(0, len(extra), 2):
+        rows.append(extra[index:index + 2])
     potion_buttons = [
         InlineKeyboardButton(f"{item['emoji']} {item['name']} x{item['qty']}", callback_data=f"btl:p:{item['item_id']}:{bid}")
         for item in (potions or [])[:2]

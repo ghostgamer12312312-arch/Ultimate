@@ -6,7 +6,10 @@ import hashlib
 import textwrap
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+try:
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+except ImportError:  # Pillow is optional for text-only deployments
+    Image = ImageDraw = ImageFilter = ImageFont = None
 
 try:
     from . import config, data
@@ -29,6 +32,11 @@ ELEMENT_COLORS = {
     "lightning": "#ffe066", "ice": "#a0e7ff", "light": "#fff3b0", "dark": "#9d4edd",
     "spirit": "#4fd1c5", "void": "#b388ff",
 }
+
+
+def _require_pil() -> None:
+    if Image is None:
+        raise RuntimeError("Pillow is required for card images. Install it with: pip install Pillow")
 
 
 def _find_font(bold: bool = False) -> str:
@@ -91,6 +99,7 @@ def _cache_path(kind: str, entity_id: str, extra: str = "") -> Path:
 
 
 def _base_card(theme_key: str) -> tuple[Image.Image, ImageDraw.ImageDraw, dict]:
+    _require_pil()
     theme = _theme(theme_key)
     bg = _rgb(theme["bg"])
     accent = _rgb(theme["accent"])

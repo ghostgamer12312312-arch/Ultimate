@@ -16,7 +16,7 @@ RUN mkdir -p /app/data /app/backups && chown -R gamer:gamer /app
 
 USER gamer
 
-ENV DB_PATH=/app/data/rpg.db \
-    BACKUP_DIR=/app/backups
+ENV ULTIMATE_DB_PATH=/app/data/ultimate.db \
+    ULTIMATE_BACKUP_DIR=/app/backups/ultimate
 
 CMD ["./start.sh"]

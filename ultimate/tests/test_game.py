@@ -153,6 +153,9 @@ def test_persistent_boss_chapters_and_skills(database, player):
 
 
 def test_summon_boss_and_cards(database, player):
+    import pytest
+
+    pytest.importorskip("PIL")
     import images
 
     database.give(1001, tickets=5, stamina=200)
