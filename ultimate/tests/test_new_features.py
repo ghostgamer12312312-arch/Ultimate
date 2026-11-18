@@ -60,3 +60,53 @@ def test_tournament_fills_and_resolves(database):
     assert state["placements"][str(champion_id)] == "champion"
     assert database.player(champion_id)["gems"] >= 60
     assert database.tournament_join(3000)["ok"] is False
+
+
+def test_aura_grant_and_duplicates(database, player):
+    assert database.grant_aura(1001, "dragonball_saiyan_aura") is True
+    assert database.aura_qty(1001, "dragonball_saiyan_aura") == 1
+    assert database.grant_aura(1001, "dragonball_saiyan_aura") is False
+    assert database.aura_qty(1001, "dragonball_saiyan_aura") == 2
+    assert len(database.player_auras(1001)) == 1
+
+
+def test_aura_equip_validation_and_global_replace(database, player):
+    database.add_character(1001, "db_goku")
+    database.add_character(1001, "db_vegeta")
+    database.grant_aura(1001, "dragonball_saiyan_aura")
+    database.grant_aura(1001, "dragonball_kaioken_aura")
+    assert database.equip_aura(1001, "dragonball_saiyan_aura", "missing")["ok"] is False
+    assert database.equip_aura(1001, "naruto_chidori_aura")["ok"] is False
+    assert database.equip_aura(1001, "dragonball_saiyan_aura", "db_goku")["ok"] is True
+    assert database.equipped_aura(1001)["aura_id"] == "dragonball_saiyan_aura"
+    assert database.equip_aura(1001, "dragonball_kaioken_aura", "db_vegeta")["ok"] is True
+    equipped = database.equipped_aura(1001)
+    assert equipped["aura_id"] == "dragonball_kaioken_aura"
+    assert equipped["char_id"] == "db_vegeta"
+    assert database.unequip_aura(1001) is True
+    assert database.equipped_aura(1001) is None
+
+
+def test_aura_spin_once_per_day(database, player):
+    first = database.claim_aura_spin(1001)
+    assert first["ok"] is True
+    assert first["aura"]["id"] == database.player_auras(1001)[0]["aura_id"]
+    second = database.claim_aura_spin(1001)
+    assert second["ok"] is False
+    assert database.aura_spin_ready(1001) is False
+
+
+def test_aura_stats_apply_only_to_carrier(database, player):
+    import game
+
+    database.add_character(1001, "db_goku")
+    database.add_character(1001, "db_vegeta")
+    database.equip_character(1001, "db_goku")
+    base = game.effective_stats(database, 1001)
+    database.grant_aura(1001, "dragonball_saiyan_aura")
+    assert database.equip_aura(1001, "dragonball_saiyan_aura", "db_goku")["ok"] is True
+    boosted = game.effective_stats(database, 1001)
+    assert boosted["hp"] == base["hp"] + 90
+    assert database.equip_aura(1001, "dragonball_saiyan_aura", "db_vegeta")["ok"] is True
+    benched = game.effective_stats(database, 1001)
+    assert benched["hp"] == base["hp"]

@@ -102,6 +102,8 @@ CREATE TABLE IF NOT EXISTS players (
     gacha_pulls INTEGER NOT NULL DEFAULT 0,
     pity INTEGER NOT NULL DEFAULT 0,
     pet_pity INTEGER NOT NULL DEFAULT 0,
+    equipped_aura TEXT,
+    aura_char TEXT,
     starter_claimed INTEGER NOT NULL DEFAULT 0,
     raid_damage INTEGER NOT NULL DEFAULT 0,
     total_battles INTEGER NOT NULL DEFAULT 0,
@@ -135,6 +137,14 @@ CREATE TABLE IF NOT EXISTS character_shards (
     char_id TEXT NOT NULL,
     qty INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(user_id, char_id)
+);
+
+CREATE TABLE IF NOT EXISTS player_auras (
+    user_id INTEGER NOT NULL,
+    aura_id TEXT NOT NULL,
+    qty INTEGER NOT NULL DEFAULT 1,
+    obtained_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, aura_id)
 );
 
 CREATE TABLE IF NOT EXISTS pets (
@@ -441,7 +451,7 @@ PLAYER_COLUMNS = {
     "weapon", "armor", "accessory", "helmet", "shoes", "pants", "clothes", "robe",
     "title", "avatar", "clan_id", "daily_day",
     "daily_streak", "weekly_week", "monthly_month", "npc_streak", "best_streak",
-    "boss_kills", "gacha_pulls", "pity", "pet_pity", "starter_claimed", "raid_damage", "total_battles", "wins",
+    "boss_kills", "gacha_pulls", "pity", "pet_pity", "equipped_aura", "aura_char", "starter_claimed", "raid_damage", "total_battles", "wins",
     "losses", "pvp_wins", "arena_rating", "clan_donation", "market_sales",
     "travel", "banned", "is_admin", "last_seen",
 }
@@ -550,6 +560,8 @@ class Database:
                 "gacha_pulls": "INTEGER NOT NULL DEFAULT 0",
                 "pity": "INTEGER NOT NULL DEFAULT 0",
                 "pet_pity": "INTEGER NOT NULL DEFAULT 0",
+                "equipped_aura": "TEXT",
+                "aura_char": "TEXT",
                 "starter_claimed": "INTEGER NOT NULL DEFAULT 0",
                 "raid_damage": "INTEGER NOT NULL DEFAULT 0",
                 "total_battles": "INTEGER NOT NULL DEFAULT 0",
@@ -1609,6 +1621,98 @@ class Database:
             else:
                 rewards.update({"yens": 300})
             self.grant_rewards(uid, rewards)
+
+    def player_auras(self, user_id: int) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM player_auras WHERE user_id=? ORDER BY obtained_at ASC",
+                (int(user_id),),
+            ).fetchall()
+        return _rows_to_dicts(rows)
+
+    def aura_qty(self, user_id: int, aura_id: str) -> int:
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT qty FROM player_auras WHERE user_id=? AND aura_id=?",
+                (int(user_id), aura_id),
+            ).fetchone()
+        return int(row["qty"]) if row else 0
+
+    def grant_aura(self, user_id: int, aura_id: str) -> bool:
+        if aura_id not in data.AURAS:
+            raise ValueError(f"Unknown aura: {aura_id}")
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT qty FROM player_auras WHERE user_id=? AND aura_id=?",
+                (int(user_id), aura_id),
+            ).fetchone()
+            if row is None:
+                c.execute(
+                    "INSERT INTO player_auras(user_id, aura_id, qty, obtained_at) VALUES(?,?,1,?)",
+                    (int(user_id), aura_id, _now()),
+                )
+                return True
+            c.execute(
+                "UPDATE player_auras SET qty=qty+1 WHERE user_id=? AND aura_id=?",
+                (int(user_id), aura_id),
+            )
+            return False
+
+    def equipped_aura(self, user_id: int) -> dict | None:
+        player = self.require_player(user_id)
+        aura_id = player.get("equipped_aura")
+        if not aura_id:
+            return None
+        return {"aura_id": aura_id, "char_id": player.get("aura_char") or ""}
+
+    def equip_aura(self, user_id: int, aura_id: str, char_id: str | None = None) -> dict:
+        if aura_id not in data.AURAS:
+            return {"ok": False, "reason": "Unknown aura."}
+        if self.aura_qty(user_id, aura_id) < 1:
+            return {"ok": False, "reason": "You do not own that aura."}
+        player = self.require_player(user_id)
+        owned = {character["id"] for character in self.characters(user_id)}
+        target = char_id or player.get("equipped_char") or next(iter(owned), None)
+        if not target or target not in owned:
+            return {"ok": False, "reason": "Choose a hero you own to carry the aura."}
+        with self.conn() as c:
+            c.execute(
+                "UPDATE players SET equipped_aura=?, aura_char=? WHERE user_id=?",
+                (aura_id, target, int(user_id)),
+            )
+        return {"ok": True, "aura_id": aura_id, "char_id": target}
+
+    def unequip_aura(self, user_id: int) -> bool:
+        with self.conn() as c:
+            cursor = c.execute(
+                "UPDATE players SET equipped_aura=NULL, aura_char=NULL WHERE user_id=?",
+                (int(user_id),),
+            )
+            return cursor.rowcount > 0
+
+    def claim_aura_spin(self, user_id: int) -> dict:
+        self.require_player(user_id)
+        today = today_key()
+        key = f"auraspin:{today}:{int(user_id)}"
+        if self.setting_get(key) == "1":
+            return {"ok": False, "reason": "You already claimed your free aura spin today."}
+        rarities = list(data.AURA_SPIN_WEIGHTS)
+        weights = [data.AURA_SPIN_WEIGHTS[rarity] for rarity in rarities]
+        rarity = random.choices(rarities, weights=weights, k=1)[0]
+        pool = data.AURAS_BY_RARITY.get(rarity) or []
+        if not pool:
+            pool = list(data.AURAS.values())
+        aura = random.choice(pool)
+        self.setting_set(key, "1")
+        is_new = self.grant_aura(user_id, aura["id"])
+        duplicate_gems = 0
+        if not is_new:
+            duplicate_gems = max(1, int(data.RARITIES[aura["rarity"]]["gem_dup"]) // 2)
+            self.grant_rewards(user_id, {"gems": duplicate_gems})
+        return {"ok": True, "aura": aura, "new": is_new, "duplicate_gems": duplicate_gems}
+
+    def aura_spin_ready(self, user_id: int) -> bool:
+        return self.setting_get(f"auraspin:{today_key()}:{int(user_id)}") != "1"
 
     def claim_daily(self, user_id: int) -> dict:
         player = self.require_player(user_id)

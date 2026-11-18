@@ -134,13 +134,27 @@ def _new_battle(db, user_id: int, mode: str, title: str, enemy: dict, meta: dict
     return battle
 
 
+BATTLE_EXPIRY_SECONDS = 30 * 60
+
+
+def _battle_expired(battle: dict) -> bool:
+    created = battle.get("created_at") or battle.get("updated_at")
+    if not created:
+        return False
+    try:
+        stamp = time.mktime(time.strptime(created, "%Y-%m-%d %H:%M:%S"))
+    except (TypeError, ValueError):
+        return False
+    return (time.time() - stamp) > BATTLE_EXPIRY_SECONDS
+
+
 def _existing(db, user_id: int) -> dict | None:
     return db.active_battle(user_id)
 
 
 def _resume(db, user_id: int) -> dict | None:
     battle = _existing(db, user_id)
-    if battle and battle.get("state", {}).get("status") == "active":
+    if battle and battle.get("state", {}).get("status") == "active" and not _battle_expired(battle):
         return battle
     if battle:
         db.clear_battle(user_id)
@@ -625,13 +639,18 @@ def _enemy_attack(db, user_id: int, battle: dict, rng: random.Random) -> None:
     state["guard"] = 0
 
 
-def act(db, user_id: int, battle_id: str, action: str, payload: str | None = None) -> dict:
+def act(db, user_id: int, battle_id: str, action: str, payload: str | None = None, expected_turn: int | None = None) -> dict:
     battle = db.active_battle(user_id)
     if battle is None or battle.get("battle_id") != battle_id:
         return {"ok": False, "reason": "That battle is no longer active.", "stale": True}
+    if _battle_expired(battle):
+        db.clear_battle(user_id)
+        return {"ok": False, "reason": "That battle expired after 30 minutes of inactivity.", "stale": True}
     state = battle["state"]
     if state.get("status") != "active":
         return {"ok": True, "battle": battle, "finished": True}
+    if expected_turn is not None and int(expected_turn) != int(state.get("turn", 1)):
+        return {"ok": False, "reason": "That turn has already passed. Use the latest battle buttons.", "stale": True}
     player = state["player"]
     enemy = state["enemy"]
     meta = state["meta"]
@@ -846,14 +865,15 @@ def keyboard(battle: dict, potions: list[dict] | None = None):
 
     state = battle["state"]
     bid = battle["battle_id"]
+    turn = int(state.get("turn", 1))
     if state.get("status") == "finished":
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("👤 Profile", callback_data="menu:profile"), InlineKeyboardButton("⚔️ Duel Again", callback_data="menu:duel")],
         ])
     player = state["player"]
     rows = [[
-        InlineKeyboardButton("⚔️ Attack", callback_data=f"btl:a:{bid}"),
-        InlineKeyboardButton("🛡️ Guard", callback_data=f"btl:g:{bid}"),
+        InlineKeyboardButton("⚔️ Attack", callback_data=f"btl:a:{bid}:{turn}"),
+        InlineKeyboardButton("🛡️ Guard", callback_data=f"btl:g:{bid}:{turn}"),
     ]]
     skill_buttons = []
     for index, skill_id in enumerate(player.get("skills", [])[:4]):
@@ -866,27 +886,27 @@ def keyboard(battle: dict, potions: list[dict] | None = None):
             label += f" ({cooldown})"
         else:
             label += f" ({_skill_cost(skill)} MP)"
-        skill_buttons.append(InlineKeyboardButton(label, callback_data=f"btl:s:{index}:{bid}"))
+        skill_buttons.append(InlineKeyboardButton(label, callback_data=f"btl:s:{index}:{bid}:{turn}"))
     if skill_buttons:
         rows.append(skill_buttons[:2])
         if len(skill_buttons) > 2:
             rows.append(skill_buttons[2:4])
     extra = []
     if int(state.get("ult", 0)) >= 100:
-        extra.append(InlineKeyboardButton("🌟 Ultimate", callback_data=f"btl:u:{bid}"))
+        extra.append(InlineKeyboardButton("🌟 Ultimate", callback_data=f"btl:u:{bid}:{turn}"))
     if int(state.get("ult", 0)) >= 50:
-        extra.append(InlineKeyboardButton("🔥 Transform", callback_data=f"btl:t:{bid}"))
+        extra.append(InlineKeyboardButton("🔥 Transform", callback_data=f"btl:t:{bid}:{turn}"))
     if len(state.get("team") or []) > 1:
-        extra.append(InlineKeyboardButton("🔄 Switch", callback_data=f"btl:x:{bid}"))
+        extra.append(InlineKeyboardButton("🔄 Switch", callback_data=f"btl:x:{bid}:{turn}"))
     for index in range(0, len(extra), 2):
         rows.append(extra[index:index + 2])
     potion_buttons = [
-        InlineKeyboardButton(f"{item['emoji']} {item['name']} x{item['qty']}", callback_data=f"btl:p:{item['item_id']}:{bid}")
+        InlineKeyboardButton(f"{item['emoji']} {item['name']} x{item['qty']}", callback_data=f"btl:p:{item['item_id']}:{bid}:{turn}")
         for item in (potions or [])[:2]
     ]
     if potion_buttons:
         rows.append(potion_buttons)
-    rows.append([InlineKeyboardButton("🏃 Flee", callback_data=f"btl:f:{bid}")])
+    rows.append([InlineKeyboardButton("🏃 Flee", callback_data=f"btl:f:{bid}:{turn}")])
     return InlineKeyboardMarkup(rows)
 
 

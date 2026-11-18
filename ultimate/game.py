@@ -150,6 +150,18 @@ def effective_stats(db, user_id: int, main_id: str | None = None) -> dict:
             if stat:
                 base[stat] *= 1.0 + float(pct) * pet_scale
 
+    aura_bonus: dict[str, float] = {}
+    equipped = db.equipped_aura(user_id)
+    if equipped and main and str(equipped.get("char_id") or "") == str(main.get("id") or ""):
+        aura = data.AURAS.get(equipped.get("aura_id"))
+        if aura:
+            for key in ("hp", "atk", "def", "spd"):
+                base[key] += float(aura["bonus"].get(key, 0) or 0)
+            aura_bonus = {
+                "crit": float(aura["bonus"].get("crit", 0) or 0),
+                "dodge": float(aura["bonus"].get("dodge", 0) or 0),
+            }
+
     active_skills = []
     if main:
         active_skills.extend(main.get("skills", []))
@@ -168,8 +180,8 @@ def effective_stats(db, user_id: int, main_id: str | None = None) -> dict:
         "spd": max(1, int(base["spd"])),
         "mp": max_mp,
         "max_mp": max_mp,
-        "crit": min(0.65, 0.08 + attributes["luck"] * 0.0008 + passives.get("crit", 0.0) + title.get("crit", 0.0) + equipped_bonus.get("crit", 0.0)),
-        "dodge": min(0.45, 0.04 + attributes["agility"] * 0.0006 + passives.get("dodge", 0.0) + title.get("dodge", 0.0) + equipped_bonus.get("dodge", 0.0)),
+        "crit": min(0.65, 0.08 + attributes["luck"] * 0.0008 + passives.get("crit", 0.0) + title.get("crit", 0.0) + equipped_bonus.get("crit", 0.0) + aura_bonus.get("crit", 0.0)),
+        "dodge": min(0.45, 0.04 + attributes["agility"] * 0.0006 + passives.get("dodge", 0.0) + title.get("dodge", 0.0) + equipped_bonus.get("dodge", 0.0) + aura_bonus.get("dodge", 0.0)),
         "drop_rate": min(0.75, passives.get("drop_rate", 0.0) + equipped_bonus.get("drop_rate", 0.0) + title.get("drop_rate", 0.0)),
         "gacha_luck": min(0.30, passives.get("gacha_luck", 0.0) + equipped_bonus.get("gacha_luck", 0.0) + title.get("gacha_luck", 0.0)),
         "element": element,

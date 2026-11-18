@@ -1442,3 +1442,96 @@ SUMMON_BOSS_BY_ID = {boss["id"]: boss for boss in SUMMON_BOSSES}
 SUMMON_BOSSES_BY_SERIES = {series: [boss for boss in SUMMON_BOSSES if boss["series"] == series] for series in SERIES_ORDER}
 
 CHAPTER_BY_ID = {chapter["id"]: chapter for chapters in CHAPTERS.values() for chapter in chapters}
+
+
+# ---------------------------------------------------------------------------
+# AURAS
+# ---------------------------------------------------------------------------
+AURA_ANIME_DEFS = {
+    "dragonball": ("Dragon Ball", "🐉", [
+        ("rare", "Saiyan Aura", "💫", "spirit"),
+        ("epic", "Kaioken Aura", "🔴", "fire"),
+        ("legendary", "Super Saiyan Blue Aura", "🔵", "lightning"),
+        ("mythic", "Ultra Instinct Aura", "⚪", "light"),
+        ("divine", "God of Destruction Aura", "🟣", "void"),
+    ]),
+    "naruto": ("Naruto", "🍥", [
+        ("rare", "Chidori Aura", "⚡", "lightning"),
+        ("epic", "Sage Mode Aura", "🧡", "earth"),
+        ("legendary", "Nine-Tails Chakra Aura", "🔥", "fire"),
+        ("mythic", "Susanoo Aura", "🟣", "dark"),
+        ("divine", "Six Paths Aura", "✨", "light"),
+    ]),
+    "bleach": ("Bleach", "⚔️", [
+        ("rare", "Quincy Aura", "🏹", "light"),
+        ("epic", "Hollow Mask Aura", "💀", "dark"),
+        ("legendary", "Bankai Aura", "🗡️", "spirit"),
+        ("mythic", "Vasto Lorde Aura", "🦇", "void"),
+        ("divine", "Mugetsu Aura", "🌑", "dark"),
+    ]),
+    "jujutsu": ("Jujutsu Kaisen", "👁️", [
+        ("rare", "Cursed Energy Aura", "🟣", "dark"),
+        ("epic", "Black Flash Aura", "⚡", "lightning"),
+        ("legendary", "Ten Shadows Aura", "🐺", "dark"),
+        ("mythic", "Domain Expansion Aura", "🌌", "void"),
+        ("divine", "Malevolent Shrine Aura", "👹", "void"),
+    ]),
+    "tempest": ("That Time I Got Reincarnated as a Slime", "💧", [
+        ("rare", "Storm Aura", "🌩️", "wind"),
+        ("epic", "Dragon Aura", "🐉", "fire"),
+        ("legendary", "Predator Aura", "🦅", "dark"),
+        ("mythic", "Void Aura", "🕳️", "void"),
+        ("divine", "Celestial Aura", "🌟", "light"),
+    ]),
+    "onepiece": ("One Piece", "🏴‍☠️", [
+        ("rare", "Observation Haki Aura", "👁️", "spirit"),
+        ("epic", "Armament Haki Aura", "🛡️", "earth"),
+        ("legendary", "Logia Aura", "🔥", "fire"),
+        ("mythic", "Conqueror's Haki Aura", "👑", "lightning"),
+        ("divine", "Gear Fifth Aura", "☀️", "light"),
+    ]),
+    "demonslayer": ("Demon Slayer", "🗡️", [
+        ("rare", "Water Breathing Aura", "💧", "water"),
+        ("epic", "Thunder Breathing Aura", "⚡", "lightning"),
+        ("legendary", "Flame Hashira Aura", "🔥", "fire"),
+        ("mythic", "Moon Breathing Aura", "🌙", "dark"),
+        ("divine", "Sun Breathing Aura", "☀️", "light"),
+    ]),
+}
+
+AURA_TIER_STATS = {
+    "rare": {"hp": 90, "atk": 14, "def": 10, "spd": 5, "crit": 0.004, "dodge": 0.004},
+    "epic": {"hp": 170, "atk": 26, "def": 18, "spd": 8, "crit": 0.007, "dodge": 0.006},
+    "legendary": {"hp": 300, "atk": 44, "def": 30, "spd": 12, "crit": 0.011, "dodge": 0.009},
+    "mythic": {"hp": 520, "atk": 72, "def": 50, "spd": 18, "crit": 0.016, "dodge": 0.013},
+    "divine": {"hp": 820, "atk": 110, "def": 76, "spd": 26, "crit": 0.022, "dodge": 0.018},
+}
+
+AURA_SPIN_WEIGHTS = {"rare": 450, "epic": 300, "legendary": 160, "mythic": 70, "divine": 20}
+
+AURAS: dict[str, dict] = {}
+AURA_ORDER: list[str] = []
+AURAS_BY_ANIME: dict[str, list[dict]] = {}
+for _key, (_anime_name, _anime_emoji, _entries) in AURA_ANIME_DEFS.items():
+    AURAS_BY_ANIME[_key] = []
+    for _rarity, _name, _emoji, _element in _entries:
+        _aura_id = f"{_key}_{_name.lower().replace(' ', '_').replace(chr(39), '').replace('-', '_')}"
+        _aura = {
+            "id": _aura_id,
+            "name": _name,
+            "emoji": _emoji,
+            "rarity": _rarity,
+            "anime": _anime_name,
+            "anime_key": _key,
+            "anime_emoji": _anime_emoji,
+            "element": _element,
+            "bonus": dict(AURA_TIER_STATS[_rarity]),
+            "lore": f"A fragment of {_anime_name} power, burning with {ELEMENTS.get(_element, {}).get('name', 'unknown')} energy.",
+        }
+        AURAS[_aura_id] = _aura
+        AURA_ORDER.append(_aura_id)
+        AURAS_BY_ANIME[_key].append(_aura)
+
+AURAS_BY_RARITY: dict[str, list[dict]] = {rarity: [] for rarity in RARITY_ORDER}
+for _aura in AURAS.values():
+    AURAS_BY_RARITY[_aura["rarity"]].append(_aura)

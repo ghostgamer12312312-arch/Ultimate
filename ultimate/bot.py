@@ -592,6 +592,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>🌍 World & Profile</b>\n"
         "/profile • /stats • /daily • /daily_status • /weekly • /monthly\n"
         "/spin — daily lucky wheel • /work — earn yens every 30m\n"
+        "/aura — aura hub • /auraspin — free daily aura • /auras — aura inventory\n"
+        "/aura_equip &lt;aura_id&gt; [hero_id] • /aura_remove • /aura_info &lt;aura_id&gt;\n"
         "/referral — invite link and rewards • /nickname &lt;name&gt; — set display name\n"
         "/tournament — weekly 10-slot arena bracket • /ping — latency and uptime\n"
         "/leaderboard [wealth|players|arena|clans|raid] — wealth/collection is page 1\n/wealth — shortcuts to wealth leaderboard • /collection — per-series collection progress\n"
@@ -854,6 +856,18 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+def _profile_aura_line(db: Database, user_id: int) -> str:
+    equipped = db.equipped_aura(user_id)
+    if not equipped:
+        return "🌟 Aura: None — use /auraspin for a free daily aura\n"
+    aura = data.AURAS.get(equipped.get("aura_id"))
+    if not aura:
+        return "🌟 Aura: None\n"
+    rarity = data.RARITIES[aura["rarity"]]
+    carrier = aura_character_name(db, equipped.get("char_id"))
+    return f"🌟 Aura: {aura['emoji']} <b>{ui.esc(aura['name'])}</b> {rarity['emoji']} • on {ui.esc(carrier)}\n"
+
+
 def profile_text(db: Database, user_id: int) -> str:
     player = db.require_player(user_id)
     stats = game.effective_stats(db, user_id)
@@ -872,7 +886,8 @@ def profile_text(db: Database, user_id: int) -> str:
         f"🗡️ ATK {ui.fmt(stats['atk'])} • 🛡️ DEF {ui.fmt(stats['def'])} • 💨 SPD {ui.fmt(stats['spd'])} • {data.ELEMENTS[stats['element']]['emoji']} {data.ELEMENTS[stats['element']]['name']}\n"
         f"🦸 <b>{ui.esc(stats['name'])}</b> • 👥 {team_names}\n"
         f"🐾 {ui.esc(pet_name)} • 🏯 {ui.esc(clan['name'] if clan else 'None')} • 🏷️ {ui.esc(title.get('name', 'None'))}\n"
-        f"💠 {ui.fmt(player['yens'])} • 💎 {ui.fmt(player['gems'])} • 🔮 {ui.fmt(player['crystals'])} • 🎟️ {player['tickets']} • 🧠 {player['skill_points']} SP\n"
+        + _profile_aura_line(db, user_id)
+        + f"💠 {ui.fmt(player['yens'])} • 💎 {ui.fmt(player['gems'])} • 🔮 {ui.fmt(player['crystals'])} • 🎟️ {player['tickets']} • 🧠 {player['skill_points']} SP\n"
         f"🎴 {len(characters)}/{len(data.CHARACTERS)} Heroes • 🎯 Pity {player['pity']}/{config.GACHA_PITY} • 🏟️ {player['arena_rating']} • ⚔️ {player['wins']}W/{player['losses']}L"
     )
 
@@ -1629,9 +1644,9 @@ async def gacha_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"🎟️ Tickets: {player['tickets']} • 💎 Gems: {ui.fmt(player['gems'])} • 🎯 Pity: {player['pity']}/{config.GACHA_PITY}",
         "",
     ]
-    for banner in data.GACHA_BANNERS.values():
-        featured = ", ".join(ui.esc(data.CHARACTERS[cid]["name"]) for cid in banner["featured"][:3] if cid in data.CHARACTERS)
-        lines.append(f"{banner['emoji']} <b>{ui.esc(banner['name'])}</b>\n   Featured: {featured or 'Mixed pool'}")
+    for entry in data.GACHA_BANNERS.values():
+        featured = ", ".join(ui.esc(data.CHARACTERS[cid]["name"]) for cid in entry["featured"][:3] if cid in data.CHARACTERS)
+        lines.append(f"{entry['emoji']} <b>{ui.esc(entry['name'])}</b>\n   Featured: {featured or 'Mixed pool'}")
     lines.append("\nTap a banner to summon heroes. Equipment gacha is /pull.")
     photo = banner("summon")
     if photo:
@@ -1645,17 +1660,17 @@ async def cmd_gacha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def banner_view(update: Update, context: ContextTypes.DEFAULT_TYPE, series: str) -> None:
-    banner = data.GACHA_BANNERS.get(series)
-    if banner is None:
+    banner_entry = data.GACHA_BANNERS.get(series)
+    if banner_entry is None:
         await respond(update, "Unknown banner.", ui.gacha_keyboard())
         return
     lines = [
-        f"{banner['emoji']} <b>{ui.esc(banner['name'])}</b>",
-        f"<i>{ui.esc(banner['description'])}</i>",
+        f"{banner_entry['emoji']} <b>{ui.esc(banner_entry['name'])}</b>",
+        f"<i>{ui.esc(banner_entry['description'])}</i>",
         "",
         "⭐ Featured:",
     ]
-    for char_id in banner["featured"]:
+    for char_id in banner_entry["featured"]:
         character = data.CHARACTERS.get(char_id)
         if not character:
             continue
@@ -3645,6 +3660,7 @@ async def cmd_daily_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"{'✅' if monthly_done else '🎁'} Monthly reward — {'claimed' if monthly_done else 'ready'}",
         "",
         f"{'✅' if spin_done else '🎡'} Lucky wheel — {'spin tomorrow' if spin_done else 'ready to spin'}",
+        f"{'✅' if not db.aura_spin_ready(update.effective_user.id) else '🌟'} Aura spin — {'claimed today' if not db.aura_spin_ready(update.effective_user.id) else 'ready to spin'}",
         f"{'💤' if remaining else '🧰'} Work shift — {'ready' if not remaining else f'in {minutes}m {seconds:02d}s'}",
         "",
         f"⚡ Stamina: <b>{player.get('stamina', 0)}/{player.get('max_stamina', 100)}</b>",
@@ -6492,6 +6508,259 @@ async def cmd_tournament_join(update: Update, context: ContextTypes.DEFAULT_TYPE
     await _join_tournament(update, context)
 
 
+def aura_bonus_text(aura: dict) -> str:
+    bonus = aura.get("bonus") or {}
+    parts = []
+    for key, label in (("hp", "❤️ HP"), ("atk", "🗡️ ATK"), ("def", "🛡️ DEF"), ("spd", "💨 SPD")):
+        value = int(bonus.get(key, 0) or 0)
+        if value:
+            parts.append(f"{label} +{value}")
+    if bonus.get("crit"):
+        parts.append(f"🎯 Crit +{float(bonus['crit']) * 100:.1f}%")
+    if bonus.get("dodge"):
+        parts.append(f"💨 Dodge +{float(bonus['dodge']) * 100:.1f}%")
+    return " • ".join(parts)
+
+
+def aura_character_name(db: Database, char_id: str | None) -> str:
+    if not char_id:
+        return "None"
+    character = data.CHARACTERS.get(char_id, {})
+    return character.get("name") or char_id
+
+
+async def cmd_aura(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    equipped = db.equipped_aura(update.effective_user.id)
+    ready = db.aura_spin_ready(update.effective_user.id)
+    owned = db.player_auras(update.effective_user.id)
+    lines = ["🌟 <b>AURA HUB</b>", ""]
+    if equipped:
+        aura = data.AURAS.get(equipped["aura_id"])
+        if aura:
+            rarity = data.RARITIES[aura["rarity"]]
+            char_name = aura_character_name(db, equipped.get("char_id"))
+            lines.extend([
+                f"Equipped: {aura['emoji']} <b>{ui.esc(aura['name'])}</b> {rarity['emoji']}",
+                f"👤 Carrier: <b>{ui.esc(char_name)}</b>",
+                f"📊 {aura_bonus_text(aura)}",
+                "",
+            ])
+    else:
+        lines.extend(["Equipped: <b>None</b>", ""])
+    lines.extend([
+        f"🎡 Free aura spin: <b>{'ready' if ready else 'claimed today'}</b>",
+        f"🎒 Auras owned: <b>{len(owned)}/{len(data.AURAS)}</b>",
+        "",
+        "Spin once a day for a chance at Rare, Epic, Legendary, Mythic and Divine auras from 7 anime worlds.",
+        "",
+        "Only <b>one</b> aura can be equipped at a time, and it empowers the hero carrying it.",
+    ])
+    rows = []
+    if ready:
+        rows.append([InlineKeyboardButton("🎡 Free Aura Spin", callback_data="aura:spin")])
+    rows.append([InlineKeyboardButton("🎒 Aura Inventory", callback_data="aura:inv:1")])
+    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    photo = banner("aura") or banner("spin") or banner("summon")
+    if photo:
+        await respond_photo(update, photo, "\n".join(lines), InlineKeyboardMarkup(rows))
+    else:
+        await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def cmd_auraspin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    result = db.claim_aura_spin(update.effective_user.id)
+    if not result["ok"]:
+        await respond(
+            update,
+            f"⏳ {ui.esc(result['reason'])}\n\nCome back tomorrow for another free aura spin.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎒 Aura Inventory", callback_data="aura:inv:1")],
+                [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
+            ]),
+        )
+        return
+    aura = result["aura"]
+    rarity = data.RARITIES[aura["rarity"]]
+    lines = [
+        "🎡 <b>AURA SPIN</b>",
+        "",
+        f"{aura['emoji']} <b>{ui.esc(aura['name'])}</b>",
+        f"{rarity['emoji']} {rarity['name']} • {aura['anime_emoji']} {ui.esc(aura['anime'])}",
+        f"📊 {aura_bonus_text(aura)}",
+        "",
+        f"<i>{ui.esc(aura['lore'])}</i>",
+        "",
+    ]
+    if result["new"]:
+        lines.append("🆕 <b>NEW AURA UNLOCKED!</b>")
+    else:
+        lines.append(f"♻️ Duplicate converted into 💎 <b>{result['duplicate_gems']} gems</b>.")
+    rows = []
+    if result["new"]:
+        rows.append([InlineKeyboardButton("⚡ Equip to Main Hero", callback_data=f"aura:equip:{aura['id']}")])
+    rows.append([InlineKeyboardButton("🎒 Aura Inventory", callback_data="aura:inv:1")])
+    rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
+    photo = banner("aura") or banner("spin") or banner("summon")
+    if photo:
+        await respond_photo(update, photo, "\n".join(lines), InlineKeyboardMarkup(rows))
+    else:
+        await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def cmd_auras(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    db = get_db(context)
+    owned = db.player_auras(update.effective_user.id)
+    equipped = db.equipped_aura(update.effective_user.id)
+    owned.sort(key=lambda row: (-data.RARITY_INDEX.get(data.AURAS.get(row["aura_id"], {}).get("rarity", "common"), 0), row["aura_id"]))
+    per_page = 8
+    total_pages = max(1, (len(owned) + per_page - 1) // per_page)
+    page = max(1, min(int(page), total_pages))
+    shown = owned[(page - 1) * per_page:page * per_page]
+    lines = [
+        "🎒 <b>AURA INVENTORY</b>",
+        f"🌟 {len(owned)}/{len(data.AURAS)} collected • Page {page}/{total_pages}",
+    ]
+    if equipped:
+        aura = data.AURAS.get(equipped["aura_id"])
+        if aura:
+            lines.append(f"✅ Equipped: {aura['emoji']} <b>{ui.esc(aura['name'])}</b> on {ui.esc(aura_character_name(db, equipped.get('char_id')))}")
+    lines.append("")
+    rows = []
+    if not shown:
+        lines.append("No auras yet. Use /auraspin for your free daily spin!")
+    for row in shown:
+        aura = data.AURAS.get(row["aura_id"])
+        if not aura:
+            continue
+        rarity = data.RARITIES[aura["rarity"]]
+        marker = "✅ " if equipped and equipped.get("aura_id") == aura["id"] else ""
+        lines.append(f"{marker}{aura['emoji']} <b>{ui.esc(aura['name'])}</b> — {rarity['emoji']} {rarity['name']} • x{row['qty']}")
+        rows.append([InlineKeyboardButton(
+            f"{marker}{aura['emoji']} {ui.trim(aura['name'], 26)} • {rarity['name']}",
+            callback_data=f"aura:view:{aura['id']}:{page}",
+        )])
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"aura:inv:{page - 1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"aura:inv:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if db.aura_spin_ready(update.effective_user.id):
+        rows.append([InlineKeyboardButton("🎡 Free Aura Spin", callback_data="aura:spin")])
+    rows.append([InlineKeyboardButton("🌟 Aura Hub", callback_data="menu:aura")])
+    photo = banner("aura") or banner("spin")
+    if photo:
+        await respond_photo(update, photo, "\n".join(lines), InlineKeyboardMarkup(rows))
+    else:
+        await respond(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def _aura_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, aura_id: str, page: int = 1) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    aura = data.AURAS.get(aura_id)
+    if aura is None:
+        await respond(update, "Unknown aura.")
+        return
+    db = get_db(context)
+    qty = db.aura_qty(update.effective_user.id, aura_id)
+    equipped = db.equipped_aura(update.effective_user.id)
+    rarity = data.RARITIES[aura["rarity"]]
+    lines = [
+        f"{aura['emoji']} <b>{ui.esc(aura['name'])}</b>",
+        f"{rarity['emoji']} {rarity['name']} • {aura['anime_emoji']} {ui.esc(aura['anime'])}",
+        f"📦 Owned: <b>{qty}</b>",
+        "",
+        f"📊 <b>Stats</b>\n{aura_bonus_text(aura)}",
+        "",
+        f"<i>{ui.esc(aura['lore'])}</i>",
+    ]
+    if equipped and equipped.get("aura_id") == aura_id:
+        lines.append(f"\n✅ Equipped on <b>{ui.esc(aura_character_name(db, equipped.get('char_id')))}</b>")
+    rows = []
+    if qty > 0:
+        characters = db.characters(update.effective_user.id)
+        by_id = {character["id"]: character["name"] for character in characters}
+        candidates = []
+        if player.get("equipped_char") in by_id:
+            candidates.append(player["equipped_char"])
+        for char_id in db.team(update.effective_user.id):
+            if char_id in by_id and char_id not in candidates:
+                candidates.append(char_id)
+        for char_id in list(by_id)[:3]:
+            if char_id not in candidates:
+                candidates.append(char_id)
+        for char_id in candidates[:3]:
+            label = f"⚡ Equip to {ui.trim(by_id[char_id], 20)}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"aura:equip:{aura_id}:{char_id}")])
+        if equipped and equipped.get("aura_id") == aura_id:
+            rows.append([InlineKeyboardButton("❌ Remove Aura", callback_data="aura:remove")])
+        if not characters:
+            lines.append("\nSummon a hero first to equip an aura.")
+    else:
+        lines.append("\nYou do not own this aura yet. Spin daily to find it!")
+        if db.aura_spin_ready(update.effective_user.id):
+            rows.append([InlineKeyboardButton("🎡 Free Aura Spin", callback_data="aura:spin")])
+    rows.append([InlineKeyboardButton("⬅️ Aura Inventory", callback_data=f"aura:inv:{page}")])
+    rows.append([InlineKeyboardButton("🌟 Aura Hub", callback_data="menu:aura")])
+    text = "\n".join(lines)
+    photo = banner("aura") or banner("spin")
+    if photo:
+        await respond_photo(update, photo, text, InlineKeyboardMarkup(rows))
+    else:
+        await respond(update, text, InlineKeyboardMarkup(rows))
+
+
+async def _aura_equip(update: Update, context: ContextTypes.DEFAULT_TYPE, aura_id: str, char_id: str | None = None) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    result = get_db(context).equip_aura(update.effective_user.id, aura_id, char_id or None)
+    if not result["ok"]:
+        await respond(update, f"❌ {ui.esc(result['reason'])}")
+        return
+    await _aura_detail(update, context, aura_id, 1)
+
+
+async def _aura_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    player = await guard(update, context)
+    if player is None:
+        return
+    get_db(context).unequip_aura(update.effective_user.id)
+    await cmd_aura(update, context)
+
+
+async def cmd_aura_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await respond(update, "Usage: /aura_info &lt;aura_id&gt;")
+        return
+    await _aura_detail(update, context, context.args[0])
+
+
+async def cmd_aura_equip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await respond(update, "Usage: /aura_equip &lt;aura_id&gt; [hero_id]")
+        return
+    await _aura_equip(update, context, context.args[0], context.args[1] if len(context.args) > 1 else None)
+
+
+async def cmd_aura_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _aura_remove(update, context)
+
+
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     command = ""
     if update.effective_message is not None and update.effective_message.text:
@@ -6655,6 +6924,9 @@ COMMANDS: list[tuple[str, str]] = [
     ("profile", "Profile, power and currencies"),
     ("daily_status", "Daily, weekly, spin and work status"),
     ("spin", "Daily lucky wheel"),
+    ("aura", "Aura hub, equip and stats"),
+    ("auraspin", "Free daily aura spin"),
+    ("auras", "Browse your aura inventory"),
     ("work", "Work a shift for yens"),
     ("referral", "Invite friends and earn rewards"),
     ("nickname", "Change your display name"),
@@ -6868,6 +7140,14 @@ HANDLERS = {
     "trade": cmd_trade,
     "grant": cmd_grant,
     "daily": cmd_daily,
+    "aura": cmd_aura,
+    "auras": cmd_auras,
+    "aura_hub": cmd_aura,
+    "auraspin": cmd_auraspin,
+    "aura_spin": cmd_auraspin,
+    "aura_info": cmd_aura_info,
+    "aura_equip": cmd_aura_equip,
+    "aura_remove": cmd_aura_remove,
     "daily_status": cmd_daily_status,
     "dailystatus": cmd_daily_status,
     "balance": cmd_wealth,
@@ -6998,6 +7278,24 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if key == "spin":
         await cmd_spin(update, context)
         return
+    if key == "aura":
+        action = parts[1] if len(parts) > 1 else "hub"
+        if action == "spin":
+            await cmd_auraspin(update, context)
+        elif action == "inv":
+            await cmd_auras(update, context, int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1)
+        elif action == "view":
+            await _aura_detail(
+                update, context, parts[2],
+                int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1,
+            )
+        elif action == "equip":
+            await _aura_equip(update, context, parts[2], parts[3] if len(parts) > 3 else None)
+        elif action == "remove":
+            await _aura_remove(update, context)
+        else:
+            await cmd_aura(update, context)
+        return
     if key == "tour":
         action = parts[1] if len(parts) > 1 else "view"
         if action == "join":
@@ -7091,6 +7389,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await cmd_explore(update, context)
         elif target == "heal":
             await cmd_heal(update, context)
+        elif target == "aura":
+            await cmd_aura(update, context)
+        elif target == "auraspin":
+            await cmd_auraspin(update, context)
         elif target == "pity":
             await cmd_pity(update, context)
         elif target == "element":
@@ -7452,9 +7754,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "a": "attack", "g": "guard", "d": "guard", "s": "skill",
             "u": "ultimate", "t": "transform", "x": "switch", "p": "potion", "f": "flee",
         }.get(raw_action, raw_action)
-        battle_id = parts[-1]
+        has_turn = len(parts) > 3 and parts[-1].isdigit()
+        battle_id = parts[-2] if has_turn else parts[-1]
+        expected_turn = int(parts[-1]) if has_turn else None
         payload = parts[2] if raw_action in ("s", "p") and len(parts) > 3 else None
-        result = battle.act(get_db(context), update.effective_user.id, battle_id, action, payload)
+        result = battle.act(get_db(context), update.effective_user.id, battle_id, action, payload, expected_turn)
         if not result["ok"]:
             await respond(update, f"❌ {ui.esc(result['reason'])}", ui.back_keyboard())
             return

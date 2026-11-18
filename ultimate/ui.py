@@ -90,6 +90,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton("🌍 Raid", callback_data="menu:raid"), InlineKeyboardButton("🏰 Dungeon", callback_data="menu:dungeon")],
         [InlineKeyboardButton("🎒 Inventory", callback_data="menu:inventory"), InlineKeyboardButton("🛒 Shop", callback_data="menu:shop")],
         [InlineKeyboardButton("🏯 Clan", callback_data="menu:clan"), InlineKeyboardButton("🐾 Pets", callback_data="menu:pets")],
+        [InlineKeyboardButton("🌟 Auras", callback_data="menu:aura"), InlineKeyboardButton("🎡 Aura Spin", callback_data="menu:auraspin")],
         [InlineKeyboardButton("🧭 Explore", callback_data="menu:explore"), InlineKeyboardButton("📜 Quests", callback_data="menu:quests")],
         [InlineKeyboardButton("🏆 Rankings", callback_data="menu:leaderboard"), InlineKeyboardButton("📖 Story", callback_data="menu:chapters")],
         [InlineKeyboardButton("💚 Heal", callback_data="menu:heal"), InlineKeyboardButton("➕ More", callback_data="menu:more")],
@@ -101,6 +102,7 @@ def more_keyboard() -> "InlineKeyboardMarkup":
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌟 Auras", callback_data="menu:aura"), InlineKeyboardButton("🎡 Aura Spin", callback_data="menu:auraspin")],
         [InlineKeyboardButton("🎣 Fish", callback_data="menu:fish"), InlineKeyboardButton("⛏️ Mine", callback_data="menu:mine")],
         [InlineKeyboardButton("🌌 Summon Boss", callback_data="menu:summonboss"), InlineKeyboardButton("🎯 Pity", callback_data="menu:pity")],
         [InlineKeyboardButton("🌀 Elements", callback_data="menu:element"), InlineKeyboardButton("🧹 Unstuck", callback_data="menu:unstuck")],
