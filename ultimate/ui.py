@@ -94,7 +94,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton("🧭 Explore", callback_data="menu:explore"), InlineKeyboardButton("📜 Quests", callback_data="menu:quests")],
         [InlineKeyboardButton("🏆 Rankings", callback_data="menu:leaderboard"), InlineKeyboardButton("📖 Story", callback_data="menu:chapters")],
         [InlineKeyboardButton("💚 Heal", callback_data="menu:heal"), InlineKeyboardButton("➕ More", callback_data="menu:more")],
-        [InlineKeyboardButton("📖 Help", callback_data="menu:help"), InlineKeyboardButton("🌐 Links", callback_data="menu:links")],
+        [InlineKeyboardButton("📘 Guide", callback_data="guide:home"), InlineKeyboardButton("❓ Help", callback_data="menu:help")],
     ])
 
 
@@ -106,6 +106,8 @@ def more_keyboard() -> "InlineKeyboardMarkup":
         [InlineKeyboardButton("🎣 Fish", callback_data="menu:fish"), InlineKeyboardButton("⛏️ Mine", callback_data="menu:mine")],
         [InlineKeyboardButton("🌌 Summon Boss", callback_data="menu:summonboss"), InlineKeyboardButton("🎯 Pity", callback_data="menu:pity")],
         [InlineKeyboardButton("🌀 Elements", callback_data="menu:element"), InlineKeyboardButton("🧹 Unstuck", callback_data="menu:unstuck")],
+        [InlineKeyboardButton("🎒 Gear", callback_data="menu:gear"), InlineKeyboardButton("🧠 Skills", callback_data="menu:skills")],
+        [InlineKeyboardButton("🌐 Links", callback_data="menu:links"), InlineKeyboardButton("📘 Guide", callback_data="guide:home")],
         [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")],
     ])
 
@@ -133,10 +135,11 @@ def series_keyboard(prefix: str, include_all: bool = False):
 def gacha_keyboard():
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    rows = []
+    buttons = []
     for series in data.SERIES_ORDER:
         info = data.SERIES[series]
-        rows.append([InlineKeyboardButton(f"{info['emoji']} {info['name']}", callback_data=f"banner:{series}")])
+        buttons.append(InlineKeyboardButton(f"{info['emoji']} {info['short']}", callback_data=f"banner:{series}"))
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
     rows.append([InlineKeyboardButton("🌌 Multiverse Ultimate", callback_data="banner:multiverse")])
     rows.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
